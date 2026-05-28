@@ -68,9 +68,7 @@ GRAB/
 │   │   └── soft_prompt_all_datasets.sh
 │   └── test/
 │       └── baseline_llm_all_datasets.sh
-├── script_slurm/
-│   ├── train/                     # Individual SLURM jobs (one dataset each)
-│   └── test/
+|
 ├── .env                           # Paths (DATA_DIR, MODEL_DIR, CKPT_DIR, PRECOMPUTED_GRAPHS)
 └── skip_list.json                 # Samples to exclude (token budget exceeded)
 ```
@@ -125,7 +123,17 @@ $PRECOMPUTED_GRAPHS/
       meta.json
 ```
 
-### 2. Install dependencies
+### 2. Download datasets
+
+Most datasets can be downloaded automatically from HuggingFace by running:
+
+```bash
+python download_datasets.py
+```
+
+This requires `DATA_DIR` to be set in `.env` first. The script covers: `wtq`, `wikisql`, `hitab`, `hctqa`, `atis`, `geoquery`, `spider`. The remaining datasets require manual download, but the script prints exact instructions for each when it finishes.
+
+### 3. Install dependencies
 
 ```bash
 python -m venv .venv
@@ -137,7 +145,9 @@ pip install -r requirements.txt
 
 ## Precomputing graph features
 
-GRAB models require precomputed graph features. Run this once per dataset before training. Outputs are written to `$PRECOMPUTED_GRAPHS/<dataset>/<run_name>/`.
+GRAB models require precomputed graph features. Precomputed graphs for all datasets are available at [GRAB-table/precomputed-graphs](https://huggingface.co/datasets/GRAB-table/precomputed-graphs) on HuggingFace. Download the relevant zip(s) and extract them under `$PRECOMPUTED_GRAPHS/<dataset>/`.
+
+To recompute from scratch, run this once per dataset before training. Outputs are written to `$PRECOMPUTED_GRAPHS/<dataset>/<run_name>/`.
 
 **Single-table datasets:**
 
