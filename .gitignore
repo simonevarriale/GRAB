@@ -1,0 +1,12 @@
+.venv
+.vscode
+.env
+
+logs
+__pycache__
+
+
+checkpoints
+script_slurm
+
+*.zip
