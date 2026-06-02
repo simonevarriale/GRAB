@@ -14,6 +14,10 @@ source .env
 
 MASTER_PORT=29573
 
+# Path to a pretrained .pth checkpoint from https://huggingface.co/GRAB-table/checkpoints
+# Leave empty for zero-shot inference with the base model ($MODEL_DIR/Qwen/Qwen3-4B-Base)
+LLM_CKPT_PATH=""
+
 declare -A MULTI_TABLE
 MULTI_TABLE["structProbe"]="False"
 MULTI_TABLE["hitab"]="False"
@@ -72,6 +76,7 @@ for DATASET in "${DATASETS[@]}"; do
         --enable_thinking "False" \
         --table_encoder_name "None" \
         --output_dir "${OUTPUT_DIR}" \
+        --llm_ckpt_path "${LLM_CKPT_PATH}" \
         --skip_list "src/skip_list.json"
 
     echo "Done: ${DATASET}"

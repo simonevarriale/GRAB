@@ -143,6 +143,37 @@ pip install -r requirements.txt
 
 ---
 
+## Checkpoints
+
+Pretrained checkpoints for all GRAB models and baselines are available on HuggingFace at [GRAB-table/checkpoints](https://huggingface.co/GRAB-table/checkpoints).
+
+Download the relevant `.pth` file and pass its path via `--llm_ckpt_path` when running `src/test.py`. Example for the `structProbe` dataset:
+
+```bash
+torchrun --nproc_per_node=2 src/test.py \
+    --model_name "base_llm" \
+    --dataset "structProbe" \
+    --multi_table "False" \
+    --prompt_type "qwen" \
+    --seed 42 \
+    --eval_batch_size 4 \
+    --num_workers 8 \
+    --llm_model_name "qwen3_4b" \
+    --llm_frozen "True" \
+    --llm_lora "False" \
+    --max_txt_len 8192 \
+    --max_new_tokens 128 \
+    --enable_thinking "False" \
+    --table_encoder_name "None" \
+    --llm_ckpt_path "/path/to/checkpoint.pth" \
+    --output_dir "$CKPT_DIR/test/base_llm/structProbe" \
+    --skip_list "src/skip_list.json"
+```
+
+When `--llm_ckpt_path` points to a `.pth` file, the script loads the saved weights on top of the base LLM (`$MODEL_DIR/Qwen/Qwen3-4B-Base` for `qwen3_4b`) before running evaluation. Leave the argument empty (or omit it) for pure zero-shot inference.
+
+---
+
 ## Precomputing graph features
 
 GRAB models require precomputed graph features. Precomputed graphs for all datasets are available at [GRAB-table/precomputed-graphs](https://huggingface.co/datasets/GRAB-table/precomputed-graphs) on HuggingFace. Download the relevant zip(s) and extract them under `$PRECOMPUTED_GRAPHS/<dataset>/`.
