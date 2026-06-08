@@ -1,3 +1,4 @@
+from src.dataset.hctqa import HCTQADataset
 from src.dataset.wtq import WTQDatasetOrig
 from src.dataset.wikisql import WikiSQLDataset
 from src.dataset.structProbe import StructProbeDataset
@@ -18,6 +19,7 @@ load_dataset = {
     'wikisql':     WikiSQLDataset,
     'structProbe': StructProbeDataset,
     'hitab':       HiTabDataset,
+    'hctqa':       HCTQADataset,
     'tabfact':     TabFactDataset,
     'tabmwp':      TabMWPDataset,
     'multihiertt': MultiHierTTDataset,
