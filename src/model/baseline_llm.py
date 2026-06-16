@@ -14,6 +14,8 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+from src.model.lm_loss import causal_lm_loss_on_labels
+
 IGNORE_INDEX = -100
 fetaqa_question_len = 512
 
@@ -259,12 +261,12 @@ class BaselineLLM(torch.nn.Module):
         label_input_ids = torch.tensor(batch_label_input_ids).to(self.model.device)
 
         with self.maybe_autocast():
-            return self.model(
+            return causal_lm_loss_on_labels(
+                self.model,
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
-                return_dict=True,
-                labels=label_input_ids
-            ).loss
+                labels=label_input_ids,
+            )
 
     def inference(self, samples):
         if self.is_instruct:
@@ -410,12 +412,12 @@ class BaselineLLM(torch.nn.Module):
         label_ids_t = torch.tensor(label_ids_padded).to(self.model.device)
 
         with self.maybe_autocast():
-            return self.model(
+            return causal_lm_loss_on_labels(
+                self.model,
                 input_ids=input_ids_t,
                 attention_mask=attn_mask_t,
-                return_dict=True,
                 labels=label_ids_t,
-            ).loss
+            )
 
     def _inference_instruct(self, samples):
         batch_size = len(samples['id'])

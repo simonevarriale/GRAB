@@ -17,6 +17,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+from src.model.lm_loss import causal_lm_loss_on_labels
+
 IGNORE_INDEX = -100
 
 
@@ -127,6 +129,7 @@ class TableSoftPromptLLM(torch.nn.Module):
         if args.llm_frozen == 'True':
             print("Freezing LLM parameters.")
             for param in model.parameters(): param.requires_grad = False
+            model.gradient_checkpointing_enable()
         elif args.llm_lora == 'True':
             print("Applying LoRA to LLM.")
             model = prepare_model_for_kbit_training(model)
@@ -328,12 +331,12 @@ class TableSoftPromptLLM(torch.nn.Module):
         label_input_ids = torch.tensor(batch_label_input_ids).to(self.model.device)
 
         with self.maybe_autocast():
-            return self.model(
+            return causal_lm_loss_on_labels(
+                self.model,
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
-                return_dict=True,
                 labels=label_input_ids,
-            ).loss
+            )
 
     def inference(self, samples):
         questions    = self.tokenizer(samples["question"], add_special_tokens=False)
