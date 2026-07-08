@@ -222,7 +222,7 @@ class GNNTableEncoderPrecomputed(nn.Module):
         hash_buffer = torch.randn(self.config.max_hash_groups, self.hidden_size, generator=gen)
         self.register_buffer("hash_buffer", hash_buffer)
 
-        self.col_type_embed = nn.Embedding(self.config.max_columns, self.hidden_size)
+        self.col_val_proj = nn.Linear(self.hidden_size, self.hidden_size)
 
         if self.config.use_value_stats:
             self.value_stats_proj = nn.Sequential(
@@ -231,7 +231,7 @@ class GNNTableEncoderPrecomputed(nn.Module):
                 nn.Linear(self.hidden_size, self.hidden_size),
             )
 
-    def _init_value_nodes(self, group_to_col, max_groups, value_stats=None):
+    def _init_value_nodes(self, group_to_col, max_groups, C, value_stats=None):
         B = group_to_col.shape[0]
         if max_groups <= self.hash_buffer.shape[0]:
             hash_vecs = self.hash_buffer[:max_groups].unsqueeze(0).expand(B, -1, -1)
@@ -241,7 +241,13 @@ class GNNTableEncoderPrecomputed(nn.Module):
             hash_vecs = torch.randn(max_groups, self.hidden_size,
                                     generator=gen, device=group_to_col.device)
             hash_vecs = hash_vecs.unsqueeze(0).expand(B, -1, -1)
-        V = hash_vecs + self.col_type_embed(group_to_col)
+        # Learnable projection of content-based column embeddings: permutation invariant
+        # (keyed by column header text, not index) and task-adaptable via col_val_proj.
+        col_emb = C.gather(
+            dim=1,
+            index=group_to_col.unsqueeze(-1).expand(-1, -1, C.shape[-1])
+        )
+        V = hash_vecs + self.col_val_proj(col_emb)
         if self.config.use_value_stats and value_stats is not None:
             V = V + self.value_stats_proj(value_stats)
         return V
@@ -249,7 +255,7 @@ class GNNTableEncoderPrecomputed(nn.Module):
     def forward(self, *, R, row_mask, C, col_mask, adj, adj_cv, group_to_col,
                 value_stats=None, q_tokens=None, q_mask=None):
         max_groups = adj.shape[2]
-        V = self._init_value_nodes(group_to_col, max_groups, value_stats)
+        V = self._init_value_nodes(group_to_col, max_groups, C, value_stats)
 
         B, max_rows, _ = R.shape
         num_cols = C.shape[1]

@@ -77,8 +77,9 @@ class TableTokenizerBase:
                 clean = numeric_vals.dropna().values
                 n_unique = len(np.unique(clean))
                 if n_unique > self.num_buckets:
+                    n_bins = max(2, int(np.ceil(np.sqrt(n_unique * self.num_buckets))))
                     bin_edges[c] = np.quantile(
-                        clean, np.linspace(0, 1, self.num_buckets + 1)[1:-1]
+                        clean, np.linspace(0, 1, n_bins + 1)[1:-1]
                     )
 
         for c in range(num_cols):
@@ -228,8 +229,10 @@ class TableTokenizerRow:
 
             if numeric_vals.notna().mean() > 0.8:
                 clean = numeric_vals.dropna().to_numpy()
-                if len(np.unique(clean)) > self.num_buckets:
-                    edges = np.quantile(clean, np.linspace(0, 1, self.num_buckets + 1)[1:-1])
+                n_unique = len(np.unique(clean))
+                if n_unique > self.num_buckets:
+                    n_bins = max(2, int(np.ceil(np.sqrt(n_unique * self.num_buckets))))
+                    edges = np.quantile(clean, np.linspace(0, 1, n_bins + 1)[1:-1])
                     nan_mask = numeric_vals.isna().to_numpy()
                     bin_idx = np.searchsorted(edges, numeric_vals.fillna(0.0).to_numpy())
                     keys = np.where(nan_mask, str_vals, bin_idx.astype(str))
@@ -454,45 +457,41 @@ class MultiTableTokenizerSplitRow(TableTokenizerWithQuestion):
                 local_num_groups = 0
                 local_group_to_shared_col = np.zeros((0,), dtype=np.int64)
             else:
-                table_values = df.to_numpy(dtype=object, copy=False)
-
-                group_ids_matrix = np.zeros((valid_rows_count, num_cols), dtype=np.int64)
-                val_to_id: Dict[str, int] = {}
-                local_group_to_shared_col_map: Dict[int, int] = {}
+                group_ids_matrix = np.empty((valid_rows_count, num_cols), dtype=np.int64)
+                shared_col_parts = []
                 current_local_gid = 0
 
-                bin_edges, numeric_cache = {}, {}
                 for c in range(num_cols):
                     numeric_vals = pd.to_numeric(df.iloc[:, c], errors="coerce")
+                    str_vals = df.iloc[:, c].astype(str).to_numpy()
+
                     if numeric_vals.notna().mean() > 0.8:
-                        numeric_cache[c] = numeric_vals
-                        clean = numeric_vals.dropna().values
+                        clean = numeric_vals.dropna().to_numpy()
                         n_unique = len(np.unique(clean))
                         if n_unique > self.num_buckets:
-                            bin_edges[c] = np.quantile(
-                                clean, np.linspace(0, 1, self.num_buckets + 1)[1:-1]
-                            )
-
-                for c in range(num_cols):
-                    is_numeric = c in bin_edges
-                    num_vals = numeric_cache.get(c)
-                    shared_col_idx = local_to_shared[(ti, c)]
-                    for r in range(valid_rows_count):
-                        if is_numeric and pd.notna(num_vals.iloc[r]):
-                            bin_idx = int(np.searchsorted(bin_edges[c], num_vals.iloc[r]))
-                            key = f"col_{c}_bin_{bin_idx}"
+                            n_bins = max(2, int(np.ceil(np.sqrt(n_unique * self.num_buckets))))
+                            edges = np.quantile(clean, np.linspace(0, 1, n_bins + 1)[1:-1])
+                            nan_mask = numeric_vals.isna().to_numpy()
+                            bin_idx = np.searchsorted(edges, numeric_vals.fillna(0.0).to_numpy())
+                            keys = np.where(nan_mask, str_vals, bin_idx.astype(str))
                         else:
-                            key = f"col_{c}_{table_values[r, c]}"
-                        if key not in val_to_id:
-                            val_to_id[key] = current_local_gid
-                            local_group_to_shared_col_map[current_local_gid] = shared_col_idx
-                            current_local_gid += 1
-                        group_ids_matrix[r, c] = val_to_id[key]
+                            keys = str_vals
+                    else:
+                        keys = str_vals
+
+                    local_ids, uniques = pd.factorize(keys, sort=False)
+                    n_uniq = len(uniques)
+                    group_ids_matrix[:, c] = local_ids + current_local_gid
+                    shared_col_parts.append(
+                        np.full(n_uniq, local_to_shared[(ti, c)], dtype=np.int64)
+                    )
+                    current_local_gid += n_uniq
 
                 local_num_groups = current_local_gid
-                local_group_to_shared_col = np.zeros(local_num_groups, dtype=np.int64)
-                for gid, shared_col_idx in local_group_to_shared_col_map.items():
-                    local_group_to_shared_col[gid] = shared_col_idx
+                local_group_to_shared_col = (
+                    np.concatenate(shared_col_parts)
+                    if shared_col_parts else np.zeros((0,), dtype=np.int64)
+                )
 
             row_table_ids_parts.append(np.full(valid_rows_count, ti, dtype=np.int64))
             group_to_col_parts.append(local_group_to_shared_col)

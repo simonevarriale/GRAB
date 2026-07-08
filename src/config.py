@@ -15,7 +15,8 @@ def parse_args_table_llama():
 
     # ---- Dataset ------------------------------------------------------------
     data = parser.add_argument_group("Dataset")
-    data.add_argument("--dataset", type=str, default='wtq')
+    data.add_argument("--dataset", type=str, default='wtq',
+                      help='Dataset name, or comma-separated list for multi-dataset training (e.g. "hitab,wtq")')
     data.add_argument("--test_dataset", type=str, default='')
     data.add_argument("--second_dataset", type=str, default='')
     data.add_argument("--prompt_type", type=str, default='llama2')
@@ -43,6 +44,12 @@ def parse_args_table_llama():
     train = parser.add_argument_group("Training")
     train.add_argument("--batch_size", type=int, default=4)
     train.add_argument("--grad_steps", type=int, default=2)
+    train.add_argument("--length_grouped", type=str, default='False',
+                       help="Group similar-length samples into each train batch "
+                            "(uses the graph row count from _graph_sizes.json as a "
+                            "length proxy) to cut padding-compute waste. Single-"
+                            "dataset graph runs only; falls back to random batching "
+                            "if the size cache is missing.")
     train.add_argument("--num_epochs", type=int, default=10)
     train.add_argument("--warmup_epochs", type=float, default=1)
     train.add_argument("--lr", type=float, default=1e-5)
@@ -66,6 +73,8 @@ def parse_args_table_llama():
     llm.add_argument("--num_token", type=int, default=1)
     llm.add_argument("--load_in_4bit", type=str, default='False',
                      help='Load the LLM weights in nf4 4-bit (bitsandbytes). Frozen backbone only.')
+    llm.add_argument("--is_instruct", type=str, default='False',
+                     help='Use chat-template (instruct) inference/training path.')
     llm.add_argument("--enable_thinking", type=str, default='False',
                      help='Enable chain-of-thought reasoning for instruct models (e.g. Qwen3). '
                           'Predictions are stripped of <think>...</think> blocks before evaluation.')
@@ -115,7 +124,31 @@ def parse_args_table_llama():
     # ---- Table encoder ------------------------------------------------------
     tenc = parser.add_argument_group("Table encoder")
     tenc.add_argument("--table_encoder_frozen", type=str, default='False')
+    tenc.add_argument("--freeze_gnn_backbone", type=str, default='False',
+                      help="Freeze only the GNN backbone (message-passing / value-init / "
+                           "table-embed) while training the resampler on top. Linear-probe "
+                           "of a pretrained GNN; requires --table_encoder_frozen False.")
     tenc.add_argument("--table_encoder_name", type=str, default=None)
+    tenc.add_argument("--gnn_pretrained_ckpt", type=str, default='',
+                      help='Path to a self-supervised GNN pretraining checkpoint '
+                           '(from src/pretrain_gnn.py). Loaded into the table encoder '
+                           'with strict=False so only the shared message-passing / '
+                           'value-init / table-embedding params are restored.')
+    tenc.add_argument("--tapas_model", type=str, default='google/tapas-base',
+                      help='TAPAS checkpoint for tapas_single_table (resolved under $MODEL_DIR, '
+                           'downloaded from HF on first use)')
+    tenc.add_argument("--tabert_checkpoint", type=str, default='',
+                      help='TaBERT model.bin for tabert_llm_online (defaults to '
+                           '$MODEL_DIR/tabert/tabert_base_k3/model.bin)')
+
+    # ---- Cross-attention injection (grab_xattn_single_table) ---------------
+    xattn = parser.add_argument_group("Cross-attention injection")
+    xattn.add_argument("--xattn_heads",    type=int,   default=8,
+                       help="Attention heads in each injected cross-attn layer")
+    xattn.add_argument("--xattn_interval", type=int,   default=1,
+                       help="Inject cross-attn after every N decoder layers (1=every layer, 2=every other)")
+    xattn.add_argument("--xattn_dropout",  type=float, default=0.0,
+                       help="Dropout in cross-attn layers")
 
     # ---- Ablations ----------------------------------------------------------
     abl = parser.add_argument_group("Ablations")

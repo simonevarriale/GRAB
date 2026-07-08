@@ -22,8 +22,14 @@ if _parent_visible:
 else:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(_local_rank)
 
+# Each prefetch worker tokenizes independently; keep the Rust tokenizer
+# single-threaded so N workers use N cores predictably instead of oversubscribing.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import argparse
 import json
+import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
@@ -36,6 +42,39 @@ from src.dataset import load_dataset
 from src.model.tokenizers import TableTokenizerRow
 from src.utils.load_local_model import load_model_local_or_hf
 
+# HF fast tokenizers are NOT thread-safe (shared truncation/padding state ->
+# "Already borrowed"), so each prefetch worker builds its own instance.
+_TLS = threading.local()
+_TOK_LOCK = threading.Lock()
+
+
+def _get_tokenizer(tok_kwargs):
+    tok = getattr(_TLS, "tok", None)
+    if tok is None:
+        with _TOK_LOCK:  # serialise construction; concurrent use after is fine
+            tok = TableTokenizerRow(**tok_kwargs)
+        _TLS.tok = tok
+    return tok
+
+
+def _forward_pooled(base_model, cat_ids, cat_masks, chunk_size):
+    """Chunked encoder forward with mean pooling.
+
+    Each chunk is trimmed to its longest real sequence so the fixed
+    max_length padding from the tokenizer is not paid in compute.
+    """
+    device = next(base_model.parameters()).device
+    chunks = []
+    for s in range(0, cat_ids.shape[0], chunk_size):
+        msk_cpu = cat_masks[s:s + chunk_size]
+        L   = max(int(msk_cpu.sum(dim=1).max().item()), 1)
+        ids = cat_ids[s:s + chunk_size, :L].to(device)
+        msk = msk_cpu[:, :L].to(device)
+        out = base_model(input_ids=ids, attention_mask=msk).last_hidden_state.float()
+        m   = msk.float().unsqueeze(-1)
+        chunks.append(((out * m).sum(1) / m.sum(1).clamp(min=1e-9)).cpu())
+    return torch.cat(chunks, dim=0)
+
 
 def _encode_batch(base_model, batch_feats, batch_q_ids, batch_q_masks, hidden_size, chunk_size_rows):
     device = next(base_model.parameters()).device
@@ -47,15 +86,8 @@ def _encode_batch(base_model, batch_feats, batch_q_ids, batch_q_masks, hidden_si
 
     if total_rows > 0:
         cat_masks_cpu = torch.cat(row_masks_list, dim=0)
-        cat_ids       = torch.cat(row_ids_list,   dim=0).to(device)
-        cat_masks_gpu = cat_masks_cpu.to(device)
-        chunks = []
-        for s in range(0, total_rows, chunk_size_rows):
-            e   = min(s + chunk_size_rows, total_rows)
-            out = base_model(input_ids=cat_ids[s:e], attention_mask=cat_masks_gpu[s:e]).last_hidden_state
-            m   = cat_masks_gpu[s:e].float().unsqueeze(-1)
-            chunks.append(((out * m).sum(1) / m.sum(1).clamp(min=1e-9)).cpu())
-        pooled     = torch.cat(chunks, dim=0)
+        cat_ids_cpu   = torch.cat(row_ids_list,   dim=0)
+        pooled     = _forward_pooled(base_model, cat_ids_cpu, cat_masks_cpu, chunk_size_rows)
         R_list     = list(torch.split(pooled,         row_counts, dim=0))
         rmask_list = [m.any(dim=-1) for m in torch.split(cat_masks_cpu, row_counts, dim=0)]
     else:
@@ -68,21 +100,25 @@ def _encode_batch(base_model, batch_feats, batch_q_ids, batch_q_masks, hidden_si
     total_cols = sum(col_counts)
 
     if total_cols > 0:
-        cat_col_ids   = torch.cat(col_ids_list,   dim=0).to(device)
-        cat_col_masks = torch.cat(col_masks_list, dim=0).to(device)
-        out = base_model(input_ids=cat_col_ids, attention_mask=cat_col_masks).last_hidden_state
-        m   = cat_col_masks.float().unsqueeze(-1)
-        pooled_cols = ((out * m).sum(1) / m.sum(1).clamp(min=1e-9)).cpu()
+        pooled_cols = _forward_pooled(
+            base_model,
+            torch.cat(col_ids_list, dim=0),
+            torch.cat(col_masks_list, dim=0),
+            chunk_size_rows,
+        )
         C_list     = list(torch.split(pooled_cols, col_counts, dim=0))
         cmask_list = [torch.ones(c, dtype=torch.bool) for c in col_counts]
     else:
         C_list     = [torch.zeros((0, hidden_size)) for _ in batch_feats]
         cmask_list = [torch.zeros((0,), dtype=torch.bool) for _ in batch_feats]
 
-    q_ids  = torch.cat(batch_q_ids,   dim=0).to(device)
-    q_mask = torch.cat(batch_q_masks, dim=0).to(device)
-    q_out  = base_model(input_ids=q_ids, attention_mask=q_mask).last_hidden_state.cpu()
-    q_mask_cpu = q_mask.bool().cpu()
+    q_ids_cpu  = torch.cat(batch_q_ids,   dim=0)
+    q_mask_cpu = torch.cat(batch_q_masks, dim=0)
+    Lq = max(int(q_mask_cpu.sum(dim=1).max().item()), 1)
+    q_ids  = q_ids_cpu[:, :Lq].to(device)
+    q_mask = q_mask_cpu[:, :Lq].to(device)
+    q_out  = base_model(input_ids=q_ids, attention_mask=q_mask).last_hidden_state.float().cpu()
+    q_mask_cpu = q_mask_cpu[:, :Lq].bool()
 
     return [
         {
@@ -107,7 +143,8 @@ def _is_oversized(feat, q_attention_mask):
     return False
 
 
-def _prepare_batch_cpu(ds, batch_idx, tokenizer):
+def _prepare_batch_cpu(ds, batch_idx, tok_kwargs):
+    tokenizer = _get_tokenizer(tok_kwargs)  # thread-local instance
     feats, q_ids_list, q_masks_list, valid_idx, excluded = [], [], [], [], []
     for idx in batch_idx:
         sample = ds[idx]
@@ -117,7 +154,7 @@ def _prepare_batch_cpu(ds, batch_idx, tokenizer):
         if table.empty:
             excluded.append(idx)
             continue
-        feat = tokenizer.encode_table(table.astype(str, copy=False))
+        feat = tokenizer.encode_table(table.astype(str))
         enc = tokenizer.tokenizer(
             sample["question"],
             padding="max_length",
@@ -135,7 +172,7 @@ def _prepare_batch_cpu(ds, batch_idx, tokenizer):
     return feats, q_ids_list, q_masks_list, valid_idx, excluded
 
 
-def _precompute_split(args, split, rank, world_size, tokenizer, base_model, hidden_size, skip_set=None):
+def _precompute_split(args, split, rank, world_size, tok_kwargs, base_model, hidden_size, skip_set=None):
     if skip_set is None:
         skip_set = set()
     kwargs = dict(prompt_type=args.prompt_type)
@@ -159,18 +196,28 @@ def _precompute_split(args, split, rank, world_size, tokenizer, base_model, hidd
     batches = [pending[s:s + args.sample_batch_size]
                for s in range(0, len(pending), args.sample_batch_size)]
 
-    it = tqdm(batches, desc=f"[rank {rank}] {split}", disable=(rank != 0))
+    it = tqdm(total=len(batches), desc=f"[rank {rank}] {split}", disable=(rank != 0))
     excluded_indices = []
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_prepare_batch_cpu, ds, batches[0], tokenizer) if batches else None
+    # Multi-worker prefetch: several CPU workers tokenize batches ahead while the
+    # (single) GPU encodes. Keep a few batches in flight so workers never idle.
+    n_workers = max(1, getattr(args, "prefetch_workers", 4))
+    max_depth = n_workers + 2
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        inflight = deque()
+        bi = 0
 
-        for i, batch_idx in enumerate(batches):
-            feats, q_ids_list, q_masks_list, valid_idx, excluded_batch = future.result()
+        def fill():
+            nonlocal bi
+            while len(inflight) < max_depth and bi < len(batches):
+                inflight.append(pool.submit(_prepare_batch_cpu, ds, batches[bi], tok_kwargs))
+                bi += 1
+
+        fill()
+        while inflight:
+            feats, q_ids_list, q_masks_list, valid_idx, excluded_batch = inflight.popleft().result()
+            fill()  # top back up so workers stay busy during the GPU forward
             excluded_indices.extend(excluded_batch)
-
-            if i + 1 < len(batches):
-                future = pool.submit(_prepare_batch_cpu, ds, batches[i + 1], tokenizer)
 
             if not feats:
                 it.update(1)
@@ -203,9 +250,13 @@ def _precompute_split(args, split, rank, world_size, tokenizer, base_model, hidd
                     "group_to_col": feat["group_to_col"].squeeze(0).contiguous(),
                     "value_stats":  feat["value_stats"].squeeze(0).contiguous(),
                 }
-                torch.save(out, out_path)
+                # Legacy (non-zip) format: torch's zip reader (PyTorchFileReader)
+                # raises OSError [Errno 22] under concurrent DataLoader workers on
+                # networked scratch. Legacy files use a robust sequential reader.
+                torch.save(out, out_path, _use_new_zipfile_serialization=False)
 
             it.update(1)
+    it.close()
 
     rank_excl_path = os.path.join(split_dir, f"excluded_rank{rank}.json")
     with open(rank_excl_path, "w") as f:
@@ -237,14 +288,14 @@ def main(args):
     torch.manual_seed(args.seed)
     torch.use_deterministic_algorithms(True, warn_only=True)
 
-    tokenizer = TableTokenizerRow(
+    tok_kwargs = dict(
         base_model_name=args.gnn_base_model,
         max_length=args.question_max_len,
         num_buckets=args.num_buckets,
         max_header_len=args.max_header_len,
         row_max_len=args.row_max_len,
     )
-    base_model = load_model_local_or_hf(args.gnn_base_model).to("cuda:0").eval()
+    base_model = load_model_local_or_hf(args.gnn_base_model, torch_dtype=torch.bfloat16).to("cuda:0").eval()
     hidden_size = base_model.config.hidden_size
 
     os.makedirs(args.precomputed_graphs, exist_ok=True)
@@ -282,7 +333,7 @@ def main(args):
         skip_set = set(skip_data.get(args.dataset, {}).get(split, {}).get('skipped_indices', []))
         if rank == 0 and skip_set:
             print(f"  Skipping {len(skip_set)} samples from skip list.")
-        _precompute_split(args, split, rank, world_size, tokenizer, base_model, hidden_size, skip_set=skip_set)
+        _precompute_split(args, split, rank, world_size, tok_kwargs, base_model, hidden_size, skip_set=skip_set)
 
     dist.destroy_process_group()
 
@@ -314,6 +365,8 @@ if __name__ == "__main__":
                         help='Max rows per transformer call (chunking within each sample batch)')
     parser.add_argument("--sample_batch_size", type=int, default=32,
                         help='Number of samples to encode per GPU batch')
+    parser.add_argument("--prefetch_workers",  type=int, default=4,
+                        help='CPU threads tokenizing batches ahead of the GPU')
 
     # Output
     parser.add_argument("--precomputed_graphs", type=str, required=True)

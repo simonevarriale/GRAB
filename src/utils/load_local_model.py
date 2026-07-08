@@ -20,16 +20,18 @@ def load_tokenizer_local_or_hf(model_name: str):
     return tokenizer
 
 
-def load_model_local_or_hf(model_name: str):
+def load_model_local_or_hf(model_name: str, torch_dtype=None):
+    import torch
     local_dir = Path(model_dir) / model_name
     local_dir.mkdir(parents=True, exist_ok=True)
+    kwargs = {"dtype": torch_dtype} if torch_dtype is not None else {}
 
     try:
-        model = AutoModel.from_pretrained(local_dir, local_files_only=True)
+        model = AutoModel.from_pretrained(local_dir, local_files_only=True, **kwargs)
         print(f"Loaded model from local: {local_dir}")
     except Exception:
         print(f"Model not found locally. Downloading: {model_name}")
-        model = AutoModel.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name, **kwargs)
         model.save_pretrained(local_dir)
         print(f"Saved model to: {local_dir}")
 
