@@ -4,6 +4,7 @@ Multi-GPU training with PyTorch DistributedDataParallel.
 Launch via:  torchrun --nproc_per_node=NUM_GPUS src/train_parallel.py [args...]
 """
 import os
+import json
 
 _local_rank = int(os.environ.get("LOCAL_RANK", 0))
 _parent_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
@@ -42,6 +43,93 @@ def is_main():
     return dist.get_rank() == 0
 
 
+def _resolve_pg_path(dataset_name, prefer=None):
+    """Auto-discover the precomputed graph directory for dataset_name.
+
+    If `prefer` (a run-name, not a path) is given and exists under the dataset
+    dir, use it -- this disambiguates datasets that have more than one folder.
+    """
+    if not precomputed_graphs_root:
+        raise ValueError(
+            f"$PRECOMPUTED_GRAPHS is not defined in .env — cannot auto-discover graphs for '{dataset_name}'"
+        )
+    dataset_dir = os.path.join(precomputed_graphs_root, dataset_name)
+    if prefer:
+        preferred = os.path.join(dataset_dir, prefer)
+        if os.path.isdir(preferred):
+            return preferred
+        raise ValueError(
+            f"--precomputed_graphs '{prefer}' not found under {dataset_dir}"
+        )
+    candidates = [
+        d for d in (os.scandir(dataset_dir) if os.path.isdir(dataset_dir) else [])
+        if d.is_dir()
+    ]
+    if len(candidates) == 1:
+        return candidates[0].path
+    elif len(candidates) == 0:
+        raise ValueError(f"No precomputed graph folder found under {dataset_dir}")
+    else:
+        names = [c.name for c in candidates]
+        raise ValueError(
+            f"Multiple precomputed graph folders found under {dataset_dir}: {names}. "
+            "Specify one with --precomputed_graphs <name>."
+        )
+
+
+def _build_split(ds_name, split, dataset_kwargs, skip_list_path):
+    """Load one split of ds_name, optionally wrapping with SkipListDataset."""
+    ds = load_dataset[ds_name](split, **dataset_kwargs)
+    if skip_list_path:
+        from src.dataset.precomputed_wrapper import SkipListDataset, load_skip_set
+        # A dataset may index a different split's jsonl than the requested split
+        # (e.g. totto_cells 'validation' is carved from the train jsonl): let it
+        # redirect which skip_list.json key to use, and contribute extra indices
+        # to drop (the slice belonging to the *other* split).
+        skip_split = getattr(ds, 'skip_split', split)
+        skip_set = set(load_skip_set(skip_list_path, ds_name, skip_split))
+        skip_set |= getattr(ds, 'extra_skip_indices', set())
+        ds = SkipListDataset(ds, skip_set)
+    return ds
+
+
+def _wrap_precomputed(ds, pg_path, split, model_name):
+    """Optionally wrap ds with PrecomputedGraphDataset."""
+    if pg_path and model_name in ('grab_single_table', 'grab_multi_table', 'tabert_llm'):
+        from src.dataset.precomputed_wrapper import PrecomputedGraphDataset
+        ds = PrecomputedGraphDataset(ds, pg_path, split)
+    return ds
+
+
+def _graph_row_lengths(dataset, pg_path, split):
+    """Per-position length proxy (graph row count) for length-grouped batching.
+
+    Walks the dataset wrappers (Precomputed/Tag/SkipList) to map each position to
+    its original sample id, then reads the row count from the precompute's
+    `_graph_sizes.json`. Returns None if the cache is absent (-> random batching).
+    """
+    from src.dataset.precomputed_wrapper import (
+        PrecomputedGraphDataset, SkipListDataset, DatasetWithTag)
+
+    sizes_path = os.path.join(pg_path, split, "_graph_sizes.json")
+    if not os.path.isfile(sizes_path):
+        return None
+    with open(sizes_path) as f:
+        sizes = json.load(f)
+
+    def ordered_ids(ds):
+        if isinstance(ds, (PrecomputedGraphDataset, DatasetWithTag)):
+            return ordered_ids(ds.base)
+        if isinstance(ds, SkipListDataset):
+            base = ordered_ids(ds.base)
+            return [base[i] for i in ds.valid_indices]
+        return list(range(len(ds)))
+
+    ids = ordered_ids(dataset)
+    default = max((v[0] for v in sizes.values()), default=1)
+    return [sizes.get(str(i), (default, 0))[0] for i in ids]
+
+
 def main(args):
     dist.init_process_group(backend="nccl", timeout=timedelta(hours=2))
     rank = dist.get_rank()
@@ -55,39 +143,6 @@ def main(args):
         print(f"Configuration: {args}")
         print(f"Training with {world_size} GPUs (DDP)")
 
-    if args.model_name in ('grab_single_table', 'grab_multi_table'):
-        pg = getattr(args, 'precomputed_graphs', '')
-        if not pg:
-            # Auto-discover: find the single subdirectory under $PRECOMPUTED_GRAPHS/<dataset>/
-            if not precomputed_graphs_root:
-                raise ValueError(
-                    "--precomputed_graphs was not set and $PRECOMPUTED_GRAPHS is not defined in .env"
-                )
-            dataset_dir = os.path.join(precomputed_graphs_root, args.dataset)
-            candidates = [
-                d for d in (os.scandir(dataset_dir) if os.path.isdir(dataset_dir) else [])
-                if d.is_dir()
-            ]
-            if len(candidates) == 1:
-                args.precomputed_graphs = candidates[0].path
-                if is_main():
-                    print(f"Auto-discovered precomputed graphs: {args.precomputed_graphs}")
-            elif len(candidates) == 0:
-                raise ValueError(f"No precomputed graph folder found under {dataset_dir}")
-            else:
-                names = [c.name for c in candidates]
-                raise ValueError(
-                    f"Multiple precomputed graph folders found under {dataset_dir}: {names}. "
-                    "Specify one with --precomputed_graphs <name>."
-                )
-        elif not os.path.isabs(pg):
-            if not precomputed_graphs_root:
-                raise ValueError(
-                    f"--precomputed_graphs '{pg}' is a relative name but "
-                    "$PRECOMPUTED_GRAPHS is not set in .env"
-                )
-            args.precomputed_graphs = os.path.join(precomputed_graphs_root, args.dataset, pg)
-
     args.llm_model_path = os.path.abspath(llama_model_path[args.llm_model_name])
     if args.table_encoder_name is None:
         if is_main():
@@ -99,6 +154,10 @@ def main(args):
     if not os.path.isdir(args.llm_model_path):
         raise ValueError(f"Local LLaMA model not found at: {args.llm_model_path}")
 
+    dataset_names = [d.strip() for d in args.dataset.split(',')]
+    multi_ds = len(dataset_names) > 1
+    uses_graphs = args.model_name in ('grab_single_table', 'grab_multi_table', 'tabert_llm')
+
     multi_table = getattr(args, 'multi_table', 'True')
     dataset_kwargs = dict(prompt_type=args.prompt_type, multi_table=multi_table)
     if getattr(args, 'max_rows_per_table', None) is not None:
@@ -106,41 +165,126 @@ def main(args):
     if getattr(args, 'dataset_max_rows', None) is not None:
         dataset_kwargs['max_rows'] = args.dataset_max_rows
 
-    train_dataset = load_dataset[args.dataset]('train', **dataset_kwargs)
-    val_dataset   = load_dataset[args.dataset]('validation', **dataset_kwargs)
-    if args.test_dataset == '':
-        test_dataset = load_dataset[args.dataset]('test', **dataset_kwargs)
-    else:
-        test_dataset = load_dataset[args.test_dataset]('test', **dataset_kwargs)
+    skip_list_path = getattr(args, 'skip_list', '')
 
-    if getattr(args, 'skip_list', ''):
-        from src.dataset.precomputed_wrapper import SkipListDataset, load_skip_set
-        train_dataset = SkipListDataset(train_dataset, load_skip_set(args.skip_list, args.dataset, 'train'))
-        val_dataset   = SkipListDataset(val_dataset,   load_skip_set(args.skip_list, args.dataset, 'validation'))
-        test_ds_name  = args.test_dataset if args.test_dataset else args.dataset
-        test_dataset  = SkipListDataset(test_dataset,  load_skip_set(args.skip_list, test_ds_name, 'test'))
-        if is_main():
+    if not multi_ds:
+        # ---- Single dataset (original path) ----
+        pg = getattr(args, 'precomputed_graphs', '')
+        if uses_graphs:
+            if not pg:
+                pg = _resolve_pg_path(dataset_names[0])
+                if is_main():
+                    print(f"Auto-discovered precomputed graphs: {pg}")
+            elif not os.path.isabs(pg):
+                if not precomputed_graphs_root:
+                    raise ValueError(
+                        f"--precomputed_graphs '{pg}' is a relative name but "
+                        "$PRECOMPUTED_GRAPHS is not set in .env"
+                    )
+                pg = os.path.join(precomputed_graphs_root, dataset_names[0], pg)
+
+        train_dataset = _build_split(dataset_names[0], 'train',      dataset_kwargs, skip_list_path)
+        val_dataset   = _build_split(dataset_names[0], 'validation', dataset_kwargs, skip_list_path)
+        test_ds_name  = args.test_dataset if args.test_dataset else dataset_names[0]
+        test_dataset  = _build_split(test_ds_name,     'test',       dataset_kwargs, skip_list_path)
+
+        if is_main() and skip_list_path:
             print(f"After skip list: train={len(train_dataset)}, val={len(val_dataset)}, test={len(test_dataset)}")
 
-    if getattr(args, 'filter_table_tokens', 'False') == 'True':
-        from transformers import AutoTokenizer
-        _tok = AutoTokenizer.from_pretrained(args.llm_model_path, use_fast=False)
-        if hasattr(train_dataset, 'filter_by_token_length'):
-            train_dataset.filter_by_token_length(_tok, args.max_txt_len)
-        del _tok
+        if getattr(args, 'filter_table_tokens', 'False') == 'True':
+            from transformers import AutoTokenizer
+            _tok = AutoTokenizer.from_pretrained(args.llm_model_path, use_fast=False)
+            if hasattr(train_dataset, 'filter_by_token_length'):
+                train_dataset.filter_by_token_length(_tok, args.max_txt_len)
+            del _tok
 
-    if getattr(args, 'precomputed_graphs', '') and args.model_name in ('grab_single_table', 'grab_multi_table'):
-        from src.dataset.precomputed_wrapper import PrecomputedGraphDataset
-        train_dataset = PrecomputedGraphDataset(train_dataset, args.precomputed_graphs, 'train')
-        val_dataset   = PrecomputedGraphDataset(val_dataset,   args.precomputed_graphs, 'validation')
-        test_dataset  = PrecomputedGraphDataset(test_dataset,  args.precomputed_graphs, 'test')
+        # When evaluating on a different dataset than we train on (--test_dataset),
+        # the test split needs ITS OWN precomputed graphs, not the train dataset's.
+        test_pg = pg
+        if uses_graphs and test_ds_name != dataset_names[0]:
+            test_pg = _resolve_pg_path(test_ds_name)
+            if is_main():
+                print(f"Using test-dataset precomputed graphs for '{test_ds_name}': {test_pg}")
+
+        train_dataset = _wrap_precomputed(train_dataset, pg,      'train',      args.model_name)
+        val_dataset   = _wrap_precomputed(val_dataset,   pg,      'validation', args.model_name)
+        test_dataset  = _wrap_precomputed(test_dataset,  test_pg, 'test',       args.model_name)
+        if pg:
+            args.precomputed_graphs = pg
+            if is_main():
+                print(f"Using precomputed graphs from {pg}")
+
+        init_prompt = train_dataset.init_prompt
+
+    else:
+        # ---- Multi-dataset ----
+        from torch.utils.data import ConcatDataset
+        from src.dataset.precomputed_wrapper import DatasetWithTag
+
+        # For multi-dataset runs --precomputed_graphs is a bare run-name (not a
+        # path): it's applied per dataset to pick which folder when a dataset has
+        # more than one. Datasets with a single folder still auto-discover.
+        pg_prefer = getattr(args, 'precomputed_graphs', '') or None
+        if is_main() and pg_prefer and os.path.isabs(pg_prefer):
+            print("Warning: --precomputed_graphs should be a run-name (not a path) "
+                  "for multi-dataset training; using it per dataset.")
+        if is_main() and args.test_dataset:
+            print("Warning: --test_dataset is ignored for multi-dataset training; each dataset is tested on its own test split.")
+
+        all_train, all_val, all_test = [], [], []
+        for ds_name in dataset_names:
+            pg = _resolve_pg_path(ds_name, prefer=pg_prefer) if uses_graphs else None
+            if is_main() and pg:
+                print(f"Auto-discovered precomputed graphs for '{ds_name}': {pg}")
+
+            train_ds = _build_split(ds_name, 'train',      dataset_kwargs, skip_list_path)
+            val_ds   = _build_split(ds_name, 'validation', dataset_kwargs, skip_list_path)
+            test_ds  = _build_split(ds_name, 'test',       dataset_kwargs, skip_list_path)
+
+            train_ds = _wrap_precomputed(train_ds, pg, 'train',      args.model_name)
+            val_ds   = _wrap_precomputed(val_ds,   pg, 'validation', args.model_name)
+            test_ds  = _wrap_precomputed(test_ds,  pg, 'test',       args.model_name)
+
+            if is_main():
+                print(f"Dataset '{ds_name}': train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}")
+
+            all_train.append(DatasetWithTag(train_ds, ds_name))
+            all_val.append(DatasetWithTag(val_ds,   ds_name))
+            all_test.append(DatasetWithTag(test_ds,  ds_name))
+
+        train_dataset = ConcatDataset(all_train)
+        val_dataset   = ConcatDataset(all_val)
+        test_dataset  = ConcatDataset(all_test)
+
         if is_main():
-            print(f"Using precomputed graphs from {args.precomputed_graphs}")
+            print(f"Multi-dataset totals: train={len(train_dataset)}, val={len(val_dataset)}, test={len(test_dataset)}")
 
-    train_sampler = DistributedSampler(
-        train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True,
-        seed=args.seed,
-    )
+        init_prompt = all_train[0].init_prompt
+
+        # The model reads meta.json from args.precomputed_graphs once at __init__ to
+        # get hidden_size. All datasets share the same encoder so the first path suffices.
+        if uses_graphs:
+            args.precomputed_graphs = _resolve_pg_path(dataset_names[0], prefer=pg_prefer)
+
+    # Length-grouped batching (single-dataset graph runs): pack similar-length
+    # tables into each batch so the GPU doesn't burn FLOPs on padding.
+    train_lengths = None
+    if (getattr(args, 'length_grouped', 'False') == 'True' and uses_graphs
+            and not multi_ds):
+        train_lengths = _graph_row_lengths(train_dataset, pg, 'train')
+        if is_main():
+            print(f"Length-grouped batching: {'ON' if train_lengths is not None else 'OFF (no _graph_sizes.json cache)'}")
+
+    if train_lengths is not None:
+        from src.utils.length_sampler import DistributedLengthGroupedSampler
+        train_sampler = DistributedLengthGroupedSampler(
+            train_lengths, args.batch_size, world_size, rank, seed=args.seed,
+        )
+    else:
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True,
+            seed=args.seed,
+        )
     val_sampler = DistributedSampler(
         val_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False,
     )
@@ -151,8 +295,9 @@ def main(args):
     persistent = args.num_workers > 0
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, sampler=train_sampler,
-        pin_memory=True, collate_fn=collate_fn, num_workers=args.num_workers,
-        worker_init_fn=worker_init_fn, persistent_workers=persistent,
+        drop_last=True, pin_memory=True, collate_fn=collate_fn,
+        num_workers=args.num_workers, worker_init_fn=worker_init_fn,
+        persistent_workers=persistent,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, sampler=val_sampler,
@@ -167,7 +312,21 @@ def main(args):
     )
 
     args.local_rank = local_rank
-    model = load_model[args.model_name](init_prompt=train_dataset.init_prompt, args=args)
+    model = load_model[args.model_name](init_prompt=init_prompt, args=args)
+
+    if getattr(args, 'llm_ckpt_path', ''):
+        ckpt_path = args.llm_ckpt_path
+        if not os.path.exists(ckpt_path):
+            raise ValueError(f"Checkpoint not found: {ckpt_path}")
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        state = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        del checkpoint, state
+        gc.collect()
+        if is_main():
+            print(f"Initialised from checkpoint: {ckpt_path}")
+            print(f"  Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+
     model = DDP(model, device_ids=[0], find_unused_parameters=False)
 
     params = [p for _, p in model.named_parameters() if p.requires_grad]
@@ -296,28 +455,46 @@ def main(args):
         for shard in gathered:
             for batch_out in shard:
                 batch_len = len(batch_out['id'])
+                ds_tags = batch_out.get('_dataset', [None] * batch_len)
                 for i in range(batch_len):
-                    sid = batch_out['id'][i]
+                    sid = (ds_tags[i], batch_out['id'][i])
                     if sid in seen_ids:
                         continue
                     seen_ids.add(sid)
                     eval_output.append({k: [v[i]] for k, v in batch_out.items()})
 
-        path = f'{args.output_dir}/model_name_{args.model_name}_final.csv'
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        acc = eval_funcs[args.dataset](eval_output, path)
-        if isinstance(acc, dict) and 'f1' in acc:
-            print(f'Final Test F1: {acc["f1"]:.4f}, CC: {acc["cc"]:.4f}')
-            with open(f'{args.output_dir}/score.txt', 'a', encoding='utf-8') as file:
-                file.write(f'{path} \nTest F1: {acc["f1"]:.4f}, CC: {acc["cc"]:.4f}\n')
-        elif isinstance(acc, dict) and 'overall_acc' in acc:
-            print(f'Final Test Acc: {acc["overall_acc"]:.4f}')
-            with open(f'{args.output_dir}/score.txt', 'a', encoding='utf-8') as file:
-                file.write(f'{path} \nTest Acc: {acc["overall_acc"]:.4f}\n')
+        os.makedirs(args.output_dir, exist_ok=True)
+
+        def _report_acc(acc, path, label=''):
+            tag = f' [{label}]' if label else ''
+            if isinstance(acc, dict) and 'f1' in acc:
+                print(f'Final Test F1{tag}: {acc["f1"]:.4f}, CC: {acc["cc"]:.4f}')
+                with open(f'{args.output_dir}/score.txt', 'a', encoding='utf-8') as f:
+                    f.write(f'{path}\nTest F1: {acc["f1"]:.4f}, CC: {acc["cc"]:.4f}\n')
+            elif isinstance(acc, dict) and 'overall_acc' in acc:
+                print(f'Final Test Acc{tag}: {acc["overall_acc"]:.4f}')
+                with open(f'{args.output_dir}/score.txt', 'a', encoding='utf-8') as f:
+                    f.write(f'{path}\nTest Acc: {acc["overall_acc"]:.4f}\n')
+            else:
+                print(f'Final Test Acc/Bleu{tag}: {acc}')
+                with open(f'{args.output_dir}/score.txt', 'a', encoding='utf-8') as f:
+                    f.write(f'{path}\nTest Acc/Bleu: {acc}\n')
+
+        if not multi_ds:
+            test_eval_name = args.test_dataset if args.test_dataset else dataset_names[0]
+            path = f'{args.output_dir}/model_name_{args.model_name}_final.csv'
+            acc = eval_funcs[test_eval_name](eval_output, path)
+            _report_acc(acc, path)
         else:
-            print(f'Final Test Acc/Blue: {acc}')
-            with open(f'{args.output_dir}/score.txt', 'a', encoding='utf-8') as file:
-                file.write(f'{path} \nTest Acc/Blue: {acc}\n')
+            from collections import defaultdict
+            by_ds = defaultdict(list)
+            for item in eval_output:
+                ds = (item.get('_dataset') or [dataset_names[0]])[0]
+                by_ds[ds].append(item)
+            for ds_name, ds_output in by_ds.items():
+                path = f'{args.output_dir}/model_name_{args.model_name}_{ds_name}_final.csv'
+                acc = eval_funcs[ds_name](ds_output, path)
+                _report_acc(acc, path, label=ds_name)
 
 
 if __name__ == "__main__":

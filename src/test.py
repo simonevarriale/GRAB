@@ -178,7 +178,7 @@ def main(args):
     if is_main():
         print(f"Test dataset size: {len(test_dataset)}")
 
-    if getattr(args, 'precomputed_graphs', '') and args.model_name in ('grab_single_table', 'grab_multi_table'):
+    if getattr(args, 'precomputed_graphs', '') and args.model_name in ('grab_single_table', 'grab_multi_table', 'tabert_llm'):
         from src.dataset.precomputed_wrapper import PrecomputedGraphDataset
         test_dataset = PrecomputedGraphDataset(test_dataset, args.precomputed_graphs, 'test')
         if second_test_dataset is not None:
