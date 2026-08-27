@@ -140,6 +140,10 @@ def parse_args_table_llama():
     tenc.add_argument("--tabert_checkpoint", type=str, default='',
                       help='TaBERT model.bin for tabert_llm_online (defaults to '
                            '$MODEL_DIR/tabert/tabert_base_k3/model.bin)')
+    tenc.add_argument("--serialization_format", type=str, default='',
+                      help="Re-serialize table_segs at load time: 'markdown', 'csv' "
+                           "or 'json' (empty = dataset's native pipe format). "
+                           "Text channel only; precomputed graphs are unaffected.")
 
     # ---- Cross-attention injection (grab_xattn_single_table) ---------------
     xattn = parser.add_argument_group("Cross-attention injection")

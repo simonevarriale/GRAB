@@ -21,11 +21,6 @@ from src.model.lm_loss import causal_lm_loss_on_labels
 
 IGNORE_INDEX = -100
 
-
-# ---------------------------------------------------------------------------
-# Encoder
-# ---------------------------------------------------------------------------
-
 @dataclass
 class SoftPromptEncoderConfig:
     hidden_size: int = 384
@@ -83,9 +78,6 @@ class SoftPromptTableEncoder(nn.Module):
         return out
 
 
-# ---------------------------------------------------------------------------
-# LLM wrapper
-# ---------------------------------------------------------------------------
 
 class TableSoftPromptLLM(torch.nn.Module):
     def __init__(self, args, **kwargs):
@@ -119,10 +111,20 @@ class TableSoftPromptLLM(torch.nn.Module):
             else:
                 self.tokenizer.bos_token = '<s>'
 
+
+        is_gemma4 = 'gemma4' in args.llm_model_name.lower() or 'gemma-4' in args.llm_model_name.lower()
+        try:
+            import flash_attn  # noqa: F401
+            attn_impl = "sdpa" if is_gemma4 else "flash_attention_2"
+        except ImportError:
+            attn_impl = "sdpa"
+        print(f"Using attention implementation: {attn_impl}")
+
         model = AutoModelForCausalLM.from_pretrained(
             args.llm_model_path,
             torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
+            attn_implementation=attn_impl,
             **llm_kwargs
         )
 

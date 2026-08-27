@@ -22,8 +22,6 @@ if _parent_visible:
 else:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(_local_rank)
 
-# Each prefetch worker tokenizes independently; keep the Rust tokenizer
-# single-threaded so N workers use N cores predictably instead of oversubscribing.
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import argparse
@@ -41,8 +39,7 @@ from src.dataset import load_dataset
 from src.model.tokenizers import MultiTableTokenizerSplitRow
 from src.utils.load_local_model import load_model_local_or_hf
 
-# HF fast tokenizers are NOT thread-safe (shared truncation/padding state ->
-# "Already borrowed"), so each prefetch worker builds its own instance.
+# HF fast tokenizers are NOT thread-safe
 _TLS = threading.local()
 _TOK_LOCK = threading.Lock()
 
@@ -132,14 +129,14 @@ def _encode_batch(base_model, batch_feats, hidden_size, chunk_size_rows):
     ]
 
 
-def _prepare_batch_cpu(ds, batch_idx, tok_kwargs):
+def _prepare_batch_cpu(ds, batch_idx, tok_kwargs, use_foreign_keys=True):
     tokenizer = _get_tokenizer(tok_kwargs)  # thread-local instance
     feats = []
     for idx in batch_idx:
         sample = ds[idx]
         dfs = sample["table"]
         question = sample["question"]
-        foreign_keys = sample.get("foreign_keys", None)
+        foreign_keys = sample.get("foreign_keys", None) if use_foreign_keys else None
         table_names = sample.get("table_names", None)
         if not isinstance(dfs, list):
             dfs = [dfs]
@@ -159,22 +156,25 @@ def _precompute_split(args, split, rank, world_size, tok_kwargs, base_model, hid
     if args.max_rows_per_table is not None:
         kwargs['max_rows_per_table'] = args.max_rows_per_table
     ds = load_dataset[args.dataset](split, prompt_type=args.prompt_type, multi_table=True, **kwargs)
-    split_dir = os.path.join(args.precomputed_graphs, split)
+    id_map = getattr(ds, '_id_map', None)
+    split_dir = os.path.join(args.precomputed_graphs, getattr(ds, 'precomputed_split', split))
     os.makedirs(split_dir, exist_ok=True)
     dist.barrier()
+
+    def file_id(i):
+        return id_map[i] if id_map is not None else i
 
     n = len(ds)
     all_indices = [i for i in range(rank, n, world_size) if i not in skip_set]
     pending = [idx for idx in all_indices
-               if not os.path.exists(os.path.join(split_dir, f"{idx}.pt"))]
+               if not os.path.exists(os.path.join(split_dir, f"{file_id(idx)}.pt"))]
 
     batches = [pending[s:s + args.sample_batch_size]
                for s in range(0, len(pending), args.sample_batch_size)]
 
     it = tqdm(total=len(batches), desc=f"[rank {rank}] {split}", disable=(rank != 0))
 
-    # Multi-worker prefetch: several CPU workers tokenize batches ahead while the
-    # (single) GPU encodes. Keep a few batches in flight so workers never idle.
+    # Multi-worker prefetch: several CPU workers tokenize batches ahead while the (single) GPU encodes.
     n_workers = max(1, getattr(args, "prefetch_workers", 4))
     max_depth = n_workers + 2
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
@@ -184,20 +184,21 @@ def _precompute_split(args, split, rank, world_size, tok_kwargs, base_model, hid
         def fill():
             nonlocal bi
             while len(inflight) < max_depth and bi < len(batches):
-                inflight.append((batches[bi], pool.submit(_prepare_batch_cpu, ds, batches[bi], tok_kwargs)))
+                inflight.append((batches[bi], pool.submit(_prepare_batch_cpu, ds, batches[bi], tok_kwargs,
+                                                          args.use_foreign_keys == 'True')))
                 bi += 1
 
         fill()
         while inflight:
             batch_idx, future = inflight.popleft()
             feats = future.result()
-            fill()  # top back up so workers stay busy during the GPU forward
+            fill() 
 
             with torch.inference_mode():
                 encoded = _encode_batch(base_model, feats, hidden_size, args.row_batch_size)
 
             for idx, feat, enc in zip(batch_idx, feats, encoded):
-                out_path = os.path.join(split_dir, f"{idx}.pt")
+                out_path = os.path.join(split_dir, f"{file_id(idx)}.pt")
                 q_msk = enc["q_mask"]
                 valid_len = int(q_msk.sum().item())
                 out = {
@@ -215,9 +216,7 @@ def _precompute_split(args, split, rank, world_size, tok_kwargs, base_model, hid
                     "col_table_ids": feat["col_table_ids"].squeeze(0).contiguous(),
                     "num_tables":    feat["num_tables"].squeeze(0),
                 }
-                # Legacy (non-zip) format: torch's zip reader (PyTorchFileReader)
-                # raises OSError [Errno 22] under concurrent DataLoader workers on
-                # networked scratch. Legacy files use a robust sequential reader.
+               
                 torch.save(out, out_path, _use_new_zipfile_serialization=False)
             it.update(1)
     it.close()
@@ -258,7 +257,7 @@ def main(args):
             "num_buckets":          args.num_buckets,
             "seed":                 args.seed,
             "multi_table":          True,
-            "fk":                   True,
+            "fk":                   args.use_foreign_keys == 'True',
             "row_variant":          True,
             "question_conditioned": True,
         }
@@ -297,6 +296,9 @@ if __name__ == "__main__":
                         help='Drop samples where any table exceeds this row count')
     parser.add_argument("--skip_list",          type=str, default="",
                         help='Path to skip_list.json')
+    parser.add_argument("--use_foreign_keys",   type=str, default="True",
+                        help="'False' = ignore FK metadata: columns linked by a foreign key "
+                             "are kept as separate nodes instead of being merged")
 
     # GNN base model
     parser.add_argument("--gnn_base_model",     type=str, required=True)

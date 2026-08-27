@@ -161,6 +161,13 @@ def main(args):
         return kwargs
 
     test_dataset = load_dataset[args.dataset]('test', **_make_dataset_kwargs())
+
+    if getattr(args, 'serialization_format', ''):
+        from src.dataset.serialization_wrapper import SerializationFormatDataset
+        test_dataset = SerializationFormatDataset(test_dataset, args.serialization_format)
+        if is_main():
+            print(f"Re-serializing table_segs as: {args.serialization_format}")
+
     init_prompt = test_dataset.init_prompt
 
     second_test_dataset = None

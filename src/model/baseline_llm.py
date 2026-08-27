@@ -44,8 +44,7 @@ class BaselineLLM(torch.nn.Module):
                 kwargs["max_memory"] = {0: '80GiB'}
 
         # nf4 4-bit quantization (bitsandbytes): shrinks a frozen backbone ~4x so a
-        # 70B fits on a single GPU. device_map="auto" places the quantized model on
-        # the rank's visible GPU.
+        # 70B fits on a single GPU.
         if getattr(args, 'load_in_4bit', 'False') == 'True':
             from transformers import BitsAndBytesConfig
             print("Loading LLM in nf4 4-bit (bitsandbytes).")
@@ -55,9 +54,7 @@ class BaselineLLM(torch.nn.Module):
                 bnb_4bit_compute_dtype=torch.bfloat16,
                 bnb_4bit_use_double_quant=True,
             )
-            # Force the whole quantized model onto the rank's single GPU. "auto"
-            # applies a headroom heuristic and offloads layers to CPU, which bnb
-            # quantization rejects ("Some modules are dispatched on the CPU or the disk").
+            # Force the whole quantized model onto the rank's single GPU. 
             kwargs["device_map"] = {"": 0}
         elif getattr(args, 'load_in_8bit', 'False') == 'True':
             from transformers import BitsAndBytesConfig
@@ -93,18 +90,27 @@ class BaselineLLM(torch.nn.Module):
 
         print(f"bos_token: {self.tokenizer.bos_token}")
 
-        # A model with no chat template cannot be instruct-tuned, regardless of name.
-        # This guards base models (e.g. Llama-3.1-70B) whose name lacks "base" from
-        # wrongly taking the chat-template inference path.
         self.is_instruct = not (
             'base' in args.llm_model_name.lower() or
-            'base' in args.llm_model_path.lower()
+            'base' in args.llm_model_path.lower() or
+            '_pt' in args.llm_model_name.lower()
         ) and getattr(self.tokenizer, 'chat_template', None) is not None
         self.enable_thinking = getattr(args, 'enable_thinking', 'False') == 'True'
         if self.is_instruct:
             print("Instruct model detected: will use chat template for inference/training.")
         if self.enable_thinking:
             print("Thinking/reasoning enabled: <think> blocks will be stripped from predictions.")
+
+        # Base models never go through the chat template, so enable_thinking=False cannot reach them
+        self.no_think_prefill_ids = []
+        if (not self.enable_thinking and not self.is_instruct
+                and 'qwen3.5' in args.llm_model_name.lower()):
+            think_id = self.tokenizer.convert_tokens_to_ids('<think>')
+            if think_id is not None and self.tokenizer.convert_ids_to_tokens(think_id) == '<think>':
+                self.no_think_prefill_ids = self.tokenizer(
+                    '\n<think>\n\n</think>\n\n', add_special_tokens=False
+                ).input_ids
+                print("Thinking disabled: pre-filling empty <think></think> block at inference.")
 
         is_gemma4 = 'gemma4' in args.llm_model_name.lower() or 'gemma-4' in args.llm_model_name.lower()
         try:
@@ -194,12 +200,15 @@ class BaselineLLM(torch.nn.Module):
                 per_table_ids.extend(tok.input_ids[:self.max_txt_len])
 
             full_desc_ids = descriptions.input_ids[idx]
-            marker = self.tokenizer("### Input:\n", add_special_tokens=False).input_ids
-            marker_len = len(marker)
             prefix_end = None
-            for pos in range(len(full_desc_ids) - marker_len + 1):
-                if full_desc_ids[pos:pos + marker_len] == marker:
-                    prefix_end = pos + marker_len
+            for marker_str in ("### Input:\n", "Input:\n", "Table:\n"):
+                marker = self.tokenizer(marker_str, add_special_tokens=False).input_ids
+                marker_len = len(marker)
+                for pos in range(len(full_desc_ids) - marker_len + 1):
+                    if full_desc_ids[pos:pos + marker_len] == marker:
+                        prefix_end = pos + marker_len
+                        break
+                if prefix_end is not None:
                     break
             if prefix_end is not None:
                 return full_desc_ids[:prefix_end] + per_table_ids
@@ -272,8 +281,14 @@ class BaselineLLM(torch.nn.Module):
         if self.is_instruct:
             return self._inference_instruct(samples)
 
-        questions = self.tokenizer(samples["question"], add_special_tokens=False)
-        descriptions = self.tokenizer(samples["desc"], add_special_tokens=False)
+        is_gemma = 'gemma' in self.args.llm_model_name.lower()
+        q_texts = [self._strip_hash_markers(q) for q in samples["question"]] if is_gemma else samples["question"]
+        d_texts = [self._strip_hash_markers(d) for d in samples["desc"]] if is_gemma else samples["desc"]
+
+        if 'llama' in self.args.llm_model_name.lower():
+            q_texts = [q if q.endswith('\n') else q + '\n' for q in q_texts]
+        questions = self.tokenizer(q_texts, add_special_tokens=False)
+        descriptions = self.tokenizer(d_texts, add_special_tokens=False)
 
         bos_embeds = self.word_embedding(
             self.tokenizer(self.tokenizer.bos_token, add_special_tokens=False, return_tensors='pt')
@@ -289,10 +304,12 @@ class BaselineLLM(torch.nn.Module):
             desc_ids = self._build_desc_ids(samples, i, descriptions)
             if self.dataset_name == 'fetaqa':
                 input_ids = (desc_ids +
-                           questions.input_ids[i][:fetaqa_question_len])
+                           questions.input_ids[i][:fetaqa_question_len] +
+                           self.no_think_prefill_ids)
             else:
                 input_ids = (desc_ids +
-                           questions.input_ids[i])
+                           questions.input_ids[i] +
+                           self.no_think_prefill_ids)
 
             inputs_embeds = self.word_embedding(torch.tensor(input_ids, device=self.device))
             inputs_embeds = torch.cat([bos_embeds, inputs_embeds], dim=0)
@@ -317,12 +334,13 @@ class BaselineLLM(torch.nn.Module):
                 pad_token_id=self.tokenizer.eos_token_id,
                 do_sample=False,
             )
-        pred = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        pred = [self._extract_response(p) for p in pred]
+        raw_pred = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        pred = [self._extract_response(p) for p in raw_pred]
 
         result = {
             'id': samples['id'],
             'pred': pred,
+            'raw_pred': raw_pred,
             'label': samples['label'],
             'question': samples['question'],
             'desc': samples['desc'],
@@ -334,12 +352,17 @@ class BaselineLLM(torch.nn.Module):
         return result
 
     @staticmethod
+    def _strip_hash_markers(text):
+        return text.replace('### ', '')
+
+    @staticmethod
     def _extract_response(text):
-        marker = '### Response:'
-        idx = text.rfind(marker)
-        if idx != -1:
-            text = text[idx + len(marker):]
+        # Only strip a marker the model emitted at the start of its own generation 
         text = text.strip()
+        for marker in ('### Response:', 'Response:', 'Answer:'):
+            if text.startswith(marker):
+                text = text[len(marker):].strip()
+                break
         text = text.split('###')[0]
         text = text.split('\n')[0]
         return text.strip()
@@ -348,6 +371,20 @@ class BaselineLLM(torch.nn.Module):
     def _strip_thinking(text):
         return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
 
+    @staticmethod
+    def _strip_alpaca_markers(text):
+        """Convert Alpaca-formatted prompt to clean prose for chat models."""
+        import re
+        text = re.sub(r'^.*?(?=### Instruction:)', '', text, flags=re.DOTALL)
+        text = re.sub(r'### Instruction:\n', '', text)
+        text = text.replace('### Input:\n', '\nTable:\n')
+        text = text.replace('### Question:\n', '\nQuestion: ')
+        for suffix in ('### Response:\n', '### Response:'):
+            if text.endswith(suffix):
+                text = text[:-len(suffix)]
+                break
+        return text.strip()
+
     def _build_chat_prompt(self, desc_text, question_text, add_generation_prompt=True):
         user_content = desc_text + question_text
         for suffix in ('### Response:\n', '### Response:'):
@@ -355,7 +392,12 @@ class BaselineLLM(torch.nn.Module):
                 user_content = user_content[:-len(suffix)]
                 break
 
-        messages = [{"role": "user", "content": user_content.strip()}]
+        user_content = user_content.strip()
+        is_gemma = 'gemma' in self.args.llm_model_name.lower()
+        if is_gemma:
+            user_content = self._strip_alpaca_markers(user_content)
+        content = [{"type": "text", "text": user_content}] if is_gemma else user_content
+        messages = [{"role": "user", "content": content}]
         kwargs = {"tokenize": False, "add_generation_prompt": add_generation_prompt}
         needs_thinking_flag = (
             'qwen3' in self.args.llm_model_name.lower() or
@@ -443,11 +485,7 @@ class BaselineLLM(torch.nn.Module):
                 attention_mask=attention_mask,
                 use_cache=True,
                 pad_token_id=self.tokenizer.eos_token_id,
-                do_sample=True,
-                temperature=0.6,
-                top_p=0.95,
-                top_k=20,
-                min_p=0.0,
+                do_sample=False,
             )
 
         new_tokens = outputs[:, input_ids.shape[1]:]

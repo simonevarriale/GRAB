@@ -726,6 +726,7 @@ def get_accuracy_multihiertt(eval_output, path=None, input_df=None):
     return {"em": round(em, 4)}
 
 
+
 eval_funcs = {
     'wtq' : get_accuracy_wtq,
     'wikisql' : get_accuracy_wtq,
@@ -739,8 +740,13 @@ eval_funcs = {
     'tabmwp': get_accuracy_wtq,
     'scitat': get_accuracy_scitat,
     'tqa_bench': get_accuracy_tqa_bench,
+    'tqa_bench_16k': get_accuracy_tqa_bench,
+    'tqa_bench_32k': get_accuracy_tqa_bench,
+    'tqa_bench_64k': get_accuracy_tqa_bench,
+    'tqa_bench_128k': get_accuracy_tqa_bench,
     'atis': get_table_metrics,
     'geoquery': get_table_metrics,
     'spider_sql': get_table_metrics,
+    'spider_qa': get_table_metrics,
     'spider_text2sql': get_accuracy_spider_text2sql,
 }

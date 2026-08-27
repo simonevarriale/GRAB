@@ -25,11 +25,62 @@ from src.model.lm_loss import causal_lm_loss_on_labels
 IGNORE_INDEX = -100
 
 
+def _load_gnn_pretrained(table_encoder, ckpt_path):
+    """Load a self-supervised GNN pretraining checkpoint (src/pretrain_gnn.py).
+
+    Uses strict=False so only the shared message-passing / value-init /
+    table-embedding params are restored; the randomly-initialised resampler is
+    left untouched and trained during fine-tuning.
+    """
+    if not ckpt_path:
+        return
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"--gnn_pretrained_ckpt not found: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    sd = ckpt.get("gnn_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+    missing, unexpected = table_encoder.load_state_dict(sd, strict=False)
+    loaded = [k for k in sd if k not in unexpected]
+    print(
+        f"Loaded pretrained GNN from {ckpt_path}: restored {len(loaded)} tensors "
+        f"(missing={len(missing)}, unexpected={len(unexpected)})."
+    )
+
+
+def _apply_encoder_freezing(table_encoder, args, label="GNN table encoder"):
+    """Freeze the table encoder according to the args.
+
+    --table_encoder_frozen True  -> freeze everything (incl. resampler).
+    --freeze_gnn_backbone  True  -> freeze only the pretrained backbone
+                                    (message-passing / value-init / table-embed),
+                                    leaving the resampler trainable. Use this to
+                                    linear-probe a pretrained GNN: train only the
+                                    resampler on top of frozen structural features.
+    Otherwise the whole encoder is trained.
+    """
+    if getattr(args, "table_encoder_frozen", "True") == "True":
+        for p in table_encoder.parameters():
+            p.requires_grad = False
+        print(f"{label} is frozen (including resampler).")
+        return
+    if getattr(args, "freeze_gnn_backbone", "False") == "True":
+        n_frozen = n_train = 0
+        for name, p in table_encoder.named_parameters():
+            if name.startswith("resampler."):
+                n_train += p.numel()
+            else:
+                p.requires_grad = False
+                n_frozen += p.numel()
+        print(f"{label}: backbone frozen ({n_frozen} params), resampler trainable ({n_train} params).")
+        return
+    print(f"{label} is unfrozen.")
+
+
 def _build_llm(args):
     """Load LLM and apply frozen/LoRA/full-train setting. Returns the model."""
     llm_kwargs = {"device_map": {"": 0}, "revision": "main"}
 
-    tokenizer = AutoTokenizer.from_pretrained(args.llm_model_path, use_fast=False)
+    use_fast = 'llama-3' in args.llm_model_name.lower()
+    tokenizer = AutoTokenizer.from_pretrained(args.llm_model_path, use_fast=use_fast)
     tokenizer.pad_token_id = 0
     tokenizer.padding_side = 'left'
 
@@ -57,10 +108,9 @@ def _build_llm(args):
             bnb_4bit_use_double_quant=True,
         )
 
-    is_gemma4 = 'gemma4' in args.llm_model_name.lower() or 'gemma-4' in args.llm_model_name.lower()
     try:
         import flash_attn  # noqa: F401
-        attn_impl = "sdpa" if is_gemma4 else "flash_attention_2"
+        attn_impl = "flash_attention_2"
     except ImportError:
         attn_impl = "sdpa"
 
@@ -68,6 +118,7 @@ def _build_llm(args):
         args.llm_model_path,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
+        trust_remote_code=True,
         attn_implementation=attn_impl,
         **llm_kwargs,
     )
@@ -165,13 +216,9 @@ class GrabSingleTable(torch.nn.Module):
 
         self.table_encoder = GNNTableEncoderPrecomputed(config=gnn_config, hidden_size=hidden_size)
         self.table_encoder.to(self.model.device)
+        _load_gnn_pretrained(self.table_encoder, getattr(args, "gnn_pretrained_ckpt", ""))
 
-        if getattr(args, "table_encoder_frozen", "True") == "True":
-            print("GNN table encoder is frozen.")
-            for param in self.table_encoder.parameters():
-                param.requires_grad = False
-        else:
-            print("GNN table encoder is unfrozen.")
+        _apply_encoder_freezing(self.table_encoder, args, label="GNN table encoder")
 
         encoder_dim = self.table_encoder.hidden_size
         cfg = self.model.config
@@ -180,7 +227,9 @@ class GrabSingleTable(torch.nn.Module):
             getattr(args, "projector_type", "linear"), encoder_dim, llm_dim, self.model.device
         )
 
-        self.is_instruct = 'Base' not in args.llm_model_path
+        self.is_instruct = not (
+            'base' in args.llm_model_path.lower() or 'base' in args.llm_model_name.lower()
+        ) and getattr(self.tokenizer, 'chat_template', None) is not None
         self.enable_thinking = getattr(args, 'enable_thinking', 'False') == 'True'
         self.no_question_conditioning = getattr(args, 'no_question_conditioning', 'False') == 'True'
         self.no_table_in_prompt = getattr(args, 'no_table_in_prompt', 'False') == 'True'
@@ -241,9 +290,12 @@ class GrabSingleTable(torch.nn.Module):
 
     def train(self, mode=True):
         super().train(mode)
-        if getattr(self.args, 'table_encoder_frozen', 'True') == 'True':
-            if hasattr(self, 'table_encoder'):
+        if hasattr(self, 'table_encoder'):
+            if getattr(self.args, 'table_encoder_frozen', 'True') == 'True':
                 self.table_encoder.eval()
+            elif getattr(self.args, 'freeze_gnn_backbone', 'False') == 'True':
+                # Frozen backbone in eval (no dropout noise); resampler keeps `mode`.
+                self.table_encoder.message_passing_layers.eval()
         return self
 
     @classmethod
@@ -442,6 +494,8 @@ class GrabSingleTable(torch.nn.Module):
         result['pred'] = [self._strip_thinking(p) for p in pred]
         if self.enable_thinking:
             result['raw_pred'] = pred
+        if '_dataset' in samples:
+            result['_dataset'] = samples['_dataset']
         if 'question_type' in samples:
             result['question_type'] = samples['question_type']
         return result
@@ -485,7 +539,7 @@ class GrabSingleTable(torch.nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# GrabMultiTable (multi-table, precomputed, base model only)
+# GrabMultiTable (multi-table, precomputed, base + instruct models)
 # ---------------------------------------------------------------------------
 
 class GrabMultiTable(torch.nn.Module):
@@ -537,13 +591,9 @@ class GrabMultiTable(torch.nn.Module):
             config=gnn_config, hidden_size=hidden_size,
         )
         self.table_encoder.to(self.model.device)
+        _load_gnn_pretrained(self.table_encoder, getattr(args, 'gnn_pretrained_ckpt', ''))
 
-        if getattr(args, 'table_encoder_frozen', 'True') == 'True':
-            print("GNN multi-table encoder is frozen.")
-            for param in self.table_encoder.parameters():
-                param.requires_grad = False
-        else:
-            print("GNN multi-table encoder is unfrozen.")
+        _apply_encoder_freezing(self.table_encoder, args, label="GNN multi-table encoder")
 
         encoder_dim = self.table_encoder.hidden_size
         cfg = self.model.config
@@ -552,9 +602,16 @@ class GrabMultiTable(torch.nn.Module):
             getattr(args, 'projector_type', 'linear'), encoder_dim, llm_dim, self.model.device
         )
 
+        self.is_instruct = not (
+            'base' in args.llm_model_path.lower() or 'base' in args.llm_model_name.lower()
+        ) and getattr(self.tokenizer, 'chat_template', None) is not None
+        self.enable_thinking = getattr(args, 'enable_thinking', 'False') == 'True'
+
         self.word_embedding = self.model.model.get_input_embeddings()
         self._bos_embeds = None
         self._pad_embeds = None
+        self._instruct_prefix_embeds = None
+        self._instruct_user_suffix_ids = None
 
     def _get_bos_embeds(self):
         if self._bos_embeds is None or self._bos_embeds.device != self.device:
@@ -571,11 +628,47 @@ class GrabMultiTable(torch.nn.Module):
             ).unsqueeze(0).detach()
         return self._pad_embeds
 
+    def _get_chat_template_parts(self):
+        _PLACEHOLDER = "__TABLE_ENCODER_PLACEHOLDER__"
+        messages = [{"role": "user", "content": _PLACEHOLDER}]
+        kwargs = {"tokenize": False, "add_generation_prompt": True}
+        if not self.enable_thinking:
+            kwargs["enable_thinking"] = False
+        try:
+            text = self.tokenizer.apply_chat_template(messages, **kwargs)
+        except TypeError:
+            kwargs.pop("enable_thinking", None)
+            text = self.tokenizer.apply_chat_template(messages, **kwargs)
+        prefix, suffix = text.split(_PLACEHOLDER)
+        return prefix, suffix
+
+    def _get_instruct_prefix_embeds(self):
+        if self._instruct_prefix_embeds is None or self._instruct_prefix_embeds.device != self.device:
+            prefix, _ = self._get_chat_template_parts()
+            ids = self.tokenizer(prefix, add_special_tokens=False, return_tensors='pt').input_ids[0].to(self.device)
+            self._instruct_prefix_embeds = self.word_embedding(ids).detach()
+        return self._instruct_prefix_embeds
+
+    def _get_instruct_user_suffix_ids(self):
+        if self._instruct_user_suffix_ids is None:
+            _, suffix = self._get_chat_template_parts()
+            self._instruct_user_suffix_ids = self.tokenizer(suffix, add_special_tokens=False).input_ids
+        return self._instruct_user_suffix_ids
+
+    @staticmethod
+    def _strip_thinking(text):
+        text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
+        text = re.sub(r'<\|channel>thought\n.*?<channel\|>\s*', '', text, flags=re.DOTALL)
+        return text.strip()
+
     def train(self, mode=True):
         super().train(mode)
-        if getattr(self.args, 'table_encoder_frozen', 'True') == 'True':
-            if hasattr(self, 'table_encoder'):
+        if hasattr(self, 'table_encoder'):
+            if getattr(self.args, 'table_encoder_frozen', 'True') == 'True':
                 self.table_encoder.eval()
+            elif getattr(self.args, 'freeze_gnn_backbone', 'False') == 'True':
+                # Frozen backbone in eval (no dropout noise); resampler keeps `mode`.
+                self.table_encoder.message_passing_layers.eval()
         return self
 
     @classmethod
@@ -613,6 +706,15 @@ class GrabMultiTable(torch.nn.Module):
         row_tids = g['row_table_ids'].to(device) if 'row_table_ids' in g else None
         col_tids = g['col_table_ids'].to(device) if 'col_table_ids' in g else None
         num_tables_t = g['num_tables'].to(device) if 'num_tables'   in g else None
+
+        # Single-table precomputes (e.g. ToTTo) carry no table-ids. The Stage-1/
+        # Stage-2 backbone was always fed zero ids (table_embed[0] added), so
+        # default to zeros here to match the frozen backbone's input distribution.
+        if row_tids is None:
+            B = R.shape[0]
+            row_tids = torch.zeros(B, R.shape[1], dtype=torch.long, device=device)
+            col_tids = torch.zeros(B, C.shape[1], dtype=torch.long, device=device)
+            num_tables_t = torch.ones(B, dtype=torch.long, device=device)
 
         if self.no_question_conditioning:
             q_tokens = None
@@ -661,8 +763,9 @@ class GrabMultiTable(torch.nn.Module):
         table_embeds_batch = self._prepare_table_embeddings(table_embeds_batch)
 
         eos_tokens = self.tokenizer(self.tokenizer.eos_token, add_special_tokens=False)
-        bos_embeds = self._get_bos_embeds()
         pad_embeds = self._get_pad_embeds()
+        if not self.is_instruct:
+            bos_embeds = self._get_bos_embeds()
 
         batch_size = len(samples['id'])
         batch_inputs_embeds = []
@@ -671,15 +774,21 @@ class GrabMultiTable(torch.nn.Module):
 
         for i in range(batch_size):
             label_input_ids = labels.input_ids[i][:self.max_new_tokens] + eos_tokens.input_ids
-            text_ids = self._build_text_input_ids(
+            desc_q_ids = self._build_text_input_ids(
                 samples, i,
                 descriptions.input_ids[i],
                 questions.input_ids[i],
                 extra_ids=table_segs_tokens[i] if has_segs else None,
-            ) + label_input_ids
+            )
 
-            inputs_embeds = self.word_embedding(torch.as_tensor(text_ids, device=self.device))
-            inputs_embeds = torch.cat([bos_embeds, table_embeds_batch[i], inputs_embeds], dim=0)
+            if self.is_instruct:
+                text_ids = desc_q_ids + self._get_instruct_user_suffix_ids() + label_input_ids
+                text_embeds = self.word_embedding(torch.as_tensor(text_ids, device=self.device))
+                inputs_embeds = torch.cat([self._get_instruct_prefix_embeds(), table_embeds_batch[i], text_embeds], dim=0)
+            else:
+                text_ids = desc_q_ids + label_input_ids
+                text_embeds = self.word_embedding(torch.as_tensor(text_ids, device=self.device))
+                inputs_embeds = torch.cat([bos_embeds, table_embeds_batch[i], text_embeds], dim=0)
             batch_inputs_embeds.append(inputs_embeds)
             batch_attention_mask.append([1] * inputs_embeds.shape[0])
             batch_label_input_ids.append(
@@ -716,8 +825,9 @@ class GrabMultiTable(torch.nn.Module):
                 for segs in samples['table_segs']
             ]
 
-        bos_embeds = self._get_bos_embeds()
         pad_embeds = self._get_pad_embeds()
+        if not self.is_instruct:
+            bos_embeds = self._get_bos_embeds()
 
         table_embeds_batch = self.encode_tables(samples)
         table_embeds_batch = self._prepare_table_embeddings(table_embeds_batch)
@@ -727,14 +837,19 @@ class GrabMultiTable(torch.nn.Module):
         batch_attention_mask = []
 
         for i in range(batch_size):
-            text_ids = self._build_text_input_ids(
+            desc_q_ids = self._build_text_input_ids(
                 samples, i,
                 descriptions.input_ids[i],
                 questions.input_ids[i],
                 extra_ids=table_segs_tokens[i] if has_segs else None,
             )
-            inputs_embeds = self.word_embedding(torch.as_tensor(text_ids, device=self.device))
-            inputs_embeds = torch.cat([bos_embeds, table_embeds_batch[i], inputs_embeds], dim=0)
+            if self.is_instruct:
+                text_ids = desc_q_ids + self._get_instruct_user_suffix_ids()
+                text_embeds = self.word_embedding(torch.as_tensor(text_ids, device=self.device))
+                inputs_embeds = torch.cat([self._get_instruct_prefix_embeds(), table_embeds_batch[i], text_embeds], dim=0)
+            else:
+                text_embeds = self.word_embedding(torch.as_tensor(desc_q_ids, device=self.device))
+                inputs_embeds = torch.cat([bos_embeds, table_embeds_batch[i], text_embeds], dim=0)
             batch_inputs_embeds.append(inputs_embeds)
             batch_attention_mask.append([1] * inputs_embeds.shape[0])
 
@@ -766,6 +881,11 @@ class GrabMultiTable(torch.nn.Module):
             'question': samples['question'],
             'desc': samples['desc'],
         }
+        result['pred'] = [self._strip_thinking(p) for p in pred]
+        if self.enable_thinking:
+            result['raw_pred'] = pred
+        if '_dataset' in samples:
+            result['_dataset'] = samples['_dataset']
         if 'eval_meta' in samples:
             result['eval_meta'] = samples['eval_meta']
         if 'question_type' in samples:

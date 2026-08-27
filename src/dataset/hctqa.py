@@ -1,4 +1,5 @@
 import io
+import os
 import pandas as pd
 from torch.utils.data import Dataset
 
@@ -46,6 +47,7 @@ class HCTQADataset(Dataset):
 
             Return only the final answer itself.
             """
+        
         self._get_linear_table()
 
         self.init_prompt = 'Please follow the instruction below.'

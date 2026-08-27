@@ -15,11 +15,12 @@ def collate_graph_batch(graphs):
     max_c  = max(g["C"].shape[0]       for g in graphs)
     max_ng = max(g["adj"].shape[1]     for g in graphs)
 
-    has_q        = "q_tokens"      in graphs[0]
-    has_vs       = "value_stats"   in graphs[0]
-    has_tids     = "row_table_ids" in graphs[0]
+ 
+    has_q        = any("q_tokens"      in g for g in graphs)
+    has_vs       = any("value_stats"   in g for g in graphs)
+    has_tids     = any("row_table_ids" in g for g in graphs)
 
-    max_lq = max(g["q_tokens"].shape[0] for g in graphs) if has_q else 0
+    max_lq = max((g["q_tokens"].shape[0] for g in graphs if "q_tokens" in g), default=0) if has_q else 0
 
     R        = torch.zeros(B, max_r,  H,     dtype=torch.float32)
     C        = torch.zeros(B, max_c,  H,     dtype=torch.float32)
@@ -49,18 +50,22 @@ def collate_graph_batch(graphs):
         adj_cv[i, :c, :ng]  = g["adj_cv"]
         g2c[i, :ng]         = g["group_to_col"]
 
-        if has_q:
+        if has_q and "q_tokens" in g:
             lq = g["q_tokens"].shape[0]
             q_tokens[i, :lq] = g["q_tokens"].float()
             q_mask[i, :lq]   = g["q_mask"]
 
-        if has_vs:
+        if has_vs and "value_stats" in g:
             value_stats[i, :ng] = g["value_stats"]
 
         if has_tids:
-            row_tids[i, :r] = g["row_table_ids"]
-            col_tids[i, :c] = g["col_table_ids"]
-            num_tables[i]   = g["num_tables"]
+            if "row_table_ids" in g:
+                row_tids[i, :r] = g["row_table_ids"]
+                col_tids[i, :c] = g["col_table_ids"]
+                num_tables[i]   = g["num_tables"]
+            else:
+                # Single-table graph in a multi-table batch: one table, id 0.
+                num_tables[i] = 1
 
     out = dict(R=R, row_mask=row_mask, C=C, col_mask=col_mask,
                adj=adj, adj_cv=adj_cv, group_to_col=g2c)
@@ -85,7 +90,11 @@ def collate_fn(batch):
     """
     if not batch:
         return {}
-    result = {key: [d[key] for d in batch] for key in batch[0]}
+    # In multi-dataset batches the samples can expose different keys (e.g. mmqa /
+    # multihiertt carry foreign_keys / db_id / query / table_names that the
+    # single-table datasets don't). 
+    all_keys = {k for d in batch for k in d}
+    result = {key: [d.get(key) for d in batch] for key in all_keys}
     if "graph" in result and isinstance(result["graph"][0], dict):
         result["graph"] = collate_graph_batch(result["graph"])
     return result

@@ -77,9 +77,12 @@ def _resolve_pg_path(dataset_name, prefer=None):
         )
 
 
-def _build_split(ds_name, split, dataset_kwargs, skip_list_path):
+def _build_split(ds_name, split, dataset_kwargs, skip_list_path, serialization_format=''):
     """Load one split of ds_name, optionally wrapping with SkipListDataset."""
     ds = load_dataset[ds_name](split, **dataset_kwargs)
+    if serialization_format:
+        from src.dataset.serialization_wrapper import SerializationFormatDataset
+        ds = SerializationFormatDataset(ds, serialization_format)
     if skip_list_path:
         from src.dataset.precomputed_wrapper import SkipListDataset, load_skip_set
         # A dataset may index a different split's jsonl than the requested split
@@ -166,6 +169,7 @@ def main(args):
         dataset_kwargs['max_rows'] = args.dataset_max_rows
 
     skip_list_path = getattr(args, 'skip_list', '')
+    ser_fmt = getattr(args, 'serialization_format', '')
 
     if not multi_ds:
         # ---- Single dataset (original path) ----
@@ -183,10 +187,10 @@ def main(args):
                     )
                 pg = os.path.join(precomputed_graphs_root, dataset_names[0], pg)
 
-        train_dataset = _build_split(dataset_names[0], 'train',      dataset_kwargs, skip_list_path)
-        val_dataset   = _build_split(dataset_names[0], 'validation', dataset_kwargs, skip_list_path)
+        train_dataset = _build_split(dataset_names[0], 'train',      dataset_kwargs, skip_list_path, ser_fmt)
+        val_dataset   = _build_split(dataset_names[0], 'validation', dataset_kwargs, skip_list_path, ser_fmt)
         test_ds_name  = args.test_dataset if args.test_dataset else dataset_names[0]
-        test_dataset  = _build_split(test_ds_name,     'test',       dataset_kwargs, skip_list_path)
+        test_dataset  = _build_split(test_ds_name,     'test',       dataset_kwargs, skip_list_path, ser_fmt)
 
         if is_main() and skip_list_path:
             print(f"After skip list: train={len(train_dataset)}, val={len(val_dataset)}, test={len(test_dataset)}")
@@ -237,9 +241,9 @@ def main(args):
             if is_main() and pg:
                 print(f"Auto-discovered precomputed graphs for '{ds_name}': {pg}")
 
-            train_ds = _build_split(ds_name, 'train',      dataset_kwargs, skip_list_path)
-            val_ds   = _build_split(ds_name, 'validation', dataset_kwargs, skip_list_path)
-            test_ds  = _build_split(ds_name, 'test',       dataset_kwargs, skip_list_path)
+            train_ds = _build_split(ds_name, 'train',      dataset_kwargs, skip_list_path, ser_fmt)
+            val_ds   = _build_split(ds_name, 'validation', dataset_kwargs, skip_list_path, ser_fmt)
+            test_ds  = _build_split(ds_name, 'test',       dataset_kwargs, skip_list_path, ser_fmt)
 
             train_ds = _wrap_precomputed(train_ds, pg, 'train',      args.model_name)
             val_ds   = _wrap_precomputed(val_ds,   pg, 'validation', args.model_name)

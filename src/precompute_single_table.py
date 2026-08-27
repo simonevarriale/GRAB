@@ -22,8 +22,6 @@ if _parent_visible:
 else:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(_local_rank)
 
-# Each prefetch worker tokenizes independently; keep the Rust tokenizer
-# single-threaded so N workers use N cores predictably instead of oversubscribing.
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import argparse
@@ -42,8 +40,7 @@ from src.dataset import load_dataset
 from src.model.tokenizers import TableTokenizerRow
 from src.utils.load_local_model import load_model_local_or_hf
 
-# HF fast tokenizers are NOT thread-safe (shared truncation/padding state ->
-# "Already borrowed"), so each prefetch worker builds its own instance.
+# HF fast tokenizers are NOT thread-safe 
 _TLS = threading.local()
 _TOK_LOCK = threading.Lock()
 
@@ -51,7 +48,7 @@ _TOK_LOCK = threading.Lock()
 def _get_tokenizer(tok_kwargs):
     tok = getattr(_TLS, "tok", None)
     if tok is None:
-        with _TOK_LOCK:  # serialise construction; concurrent use after is fine
+        with _TOK_LOCK:  
             tok = TableTokenizerRow(**tok_kwargs)
         _TLS.tok = tok
     return tok
@@ -184,14 +181,19 @@ def _precompute_split(args, split, rank, world_size, tok_kwargs, base_model, hid
         if "multi_table" not in str(e):
             raise
         ds = load_dataset[args.dataset](split, **kwargs)
-    split_dir = os.path.join(args.precomputed_graphs, split)
+    
+    id_map = getattr(ds, '_id_map', None)
+    split_dir = os.path.join(args.precomputed_graphs, getattr(ds, 'precomputed_split', split))
     os.makedirs(split_dir, exist_ok=True)
     dist.barrier()
+
+    def file_id(i):
+        return id_map[i] if id_map is not None else i
 
     n = len(ds)
     all_indices = [i for i in range(rank, n, world_size) if i not in skip_set]
     pending = [idx for idx in all_indices
-               if not os.path.exists(os.path.join(split_dir, f"{idx}.pt"))]
+               if not os.path.exists(os.path.join(split_dir, f"{file_id(idx)}.pt"))]
 
     batches = [pending[s:s + args.sample_batch_size]
                for s in range(0, len(pending), args.sample_batch_size)]
@@ -199,8 +201,7 @@ def _precompute_split(args, split, rank, world_size, tok_kwargs, base_model, hid
     it = tqdm(total=len(batches), desc=f"[rank {rank}] {split}", disable=(rank != 0))
     excluded_indices = []
 
-    # Multi-worker prefetch: several CPU workers tokenize batches ahead while the
-    # (single) GPU encodes. Keep a few batches in flight so workers never idle.
+    # Multi-worker prefetch: several CPU workers tokenize batches ahead while the GPU encodes.
     n_workers = max(1, getattr(args, "prefetch_workers", 4))
     max_depth = n_workers + 2
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
@@ -216,7 +217,7 @@ def _precompute_split(args, split, rank, world_size, tok_kwargs, base_model, hid
         fill()
         while inflight:
             feats, q_ids_list, q_masks_list, valid_idx, excluded_batch = inflight.popleft().result()
-            fill()  # top back up so workers stay busy during the GPU forward
+            fill()  
             excluded_indices.extend(excluded_batch)
 
             if not feats:
@@ -235,7 +236,7 @@ def _precompute_split(args, split, rank, world_size, tok_kwargs, base_model, hid
                 continue
 
             for idx, feat, enc in zip(valid_idx, feats, encoded):
-                out_path = os.path.join(split_dir, f"{idx}.pt")
+                out_path = os.path.join(split_dir, f"{file_id(idx)}.pt")
                 q_msk = enc["q_mask"]
                 valid_len = int(q_msk.sum().item())
                 out = {
@@ -250,9 +251,7 @@ def _precompute_split(args, split, rank, world_size, tok_kwargs, base_model, hid
                     "group_to_col": feat["group_to_col"].squeeze(0).contiguous(),
                     "value_stats":  feat["value_stats"].squeeze(0).contiguous(),
                 }
-                # Legacy (non-zip) format: torch's zip reader (PyTorchFileReader)
-                # raises OSError [Errno 22] under concurrent DataLoader workers on
-                # networked scratch. Legacy files use a robust sequential reader.
+                
                 torch.save(out, out_path, _use_new_zipfile_serialization=False)
 
             it.update(1)

@@ -114,6 +114,18 @@ class MMQADataset(Dataset):
                 "- Use the shortest possible answer.\n\n"
                 "### Input:\n"
             )
+        elif self.prompt_type == 'gemma_pt':
+            prefix = (
+                f"{self.instruction}\n\n"
+                "Rules:\n"
+                "- Output ONLY the answer.\n"
+                "- Do NOT explain.\n"
+                "- Do NOT repeat the question.\n"
+                "- Do NOT add any extra words.\n"
+                "- Use the shortest possible answer.\n"
+                "- If the answer contains multiple values, list them separated by \" | \".\n\n"
+                "Tables:\n"
+            )
         else:
             raise ValueError(f'Unknown prompt_type: {self.prompt_type}')
 
@@ -133,6 +145,8 @@ class MMQADataset(Dataset):
             question = f'### Question:\n{item["question"]}\n\n### Response:'
         elif self.prompt_type in ('mistral', 'llama2', 'small'):
             question = f'### Question:\n{item["question"]}\n\n### Response:\n'
+        elif self.prompt_type == 'gemma_pt':
+            question = f'Question: {item["question"]}\nAnswer:'
         else:
             raise ValueError(f'Unknown prompt_type: {self.prompt_type}')
 

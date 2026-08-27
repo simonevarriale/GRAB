@@ -183,3 +183,40 @@ class TQABenchDataset(Dataset):
         if table_segs is not None:
             item['table_segs'] = table_segs
         return item
+
+
+class TQABench16kDataset(TQABenchDataset):
+    """TQA-Bench at the 16k context scale (larger DBs, same questions protocol).
+
+    The serialized tables exceed the 8,192-token prompt budget, so the text
+    channel is truncated at inference while the graph channel stays complete —
+    the large-schema stress setting (R2-W3 / R3-W2).
+    """
+
+    def __init__(self, type: str, prompt_type: str = 'qwen', **kwargs):
+        kwargs.pop('scale', None)
+        super().__init__(type, prompt_type=prompt_type, scale='16k', **kwargs)
+
+
+class TQABench32kDataset(TQABenchDataset):
+    """TQA-Bench at the 32k context scale."""
+
+    def __init__(self, type: str, prompt_type: str = 'qwen', **kwargs):
+        kwargs.pop('scale', None)
+        super().__init__(type, prompt_type=prompt_type, scale='32k', **kwargs)
+
+
+class TQABench64kDataset(TQABenchDataset):
+    """TQA-Bench at the 64k context scale."""
+
+    def __init__(self, type: str, prompt_type: str = 'qwen', **kwargs):
+        kwargs.pop('scale', None)
+        super().__init__(type, prompt_type=prompt_type, scale='64k', **kwargs)
+
+
+class TQABench128kDataset(TQABenchDataset):
+    """TQA-Bench at the 128k context scale."""
+
+    def __init__(self, type: str, prompt_type: str = 'qwen', **kwargs):
+        kwargs.pop('scale', None)
+        super().__init__(type, prompt_type=prompt_type, scale='128k', **kwargs)
