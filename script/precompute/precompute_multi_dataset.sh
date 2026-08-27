@@ -25,7 +25,7 @@ declare -A ROW_MAX=(
     [tqa_bench]=384
     [atis]=128
     [geoquery]=64
-    [spider_sql]=384
+    [spider_qa]=384
 )
 declare -A HDR_MAX=(
     [multihiertt]=64
@@ -34,7 +34,7 @@ declare -A HDR_MAX=(
     [tqa_bench]=8
     [atis]=8
     [geoquery]=8
-    [spider_sql]=16
+    [spider_qa]=16
 )
 
 TORCHRUN="torchrun --nproc_per_node=2 --master_port 29601"
@@ -60,7 +60,7 @@ run_multi() {
         --skip_list          "${SKIP_LIST}"
 }
 
-DATASETS=("multihiertt" "scitat" "mmqa" "tqa_bench" "atis" "geoquery" "spider_sql")
+DATASETS=("multihiertt" "scitat" "mmqa" "tqa_bench" "atis" "geoquery" "spider_qa")
 
 mkdir -p logs/precompute
 
