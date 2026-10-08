@@ -2,6 +2,8 @@
 
 GRAB is a framework for table question answering and table-grounded reasoning. It encodes structured tables as tripartite graphs and injects the resulting embeddings into a frozen large language model (LLM), enabling the model to reason over complex tabular data.
 
+Paper link: https://arxiv.org/abs/2606.28916
+
 ![GRAB architecture](GRAB.png)
 
 ---
@@ -317,3 +319,21 @@ bash script/test/baseline_llm_all_datasets.sh
 | `--max_hash_groups` | Size of the value-node hash buffer |
 | `--skip_list` | Path to `skip_list.json` (samples exceeding token budget) |
 | `--output_dir` | Where to write checkpoints, predictions, and scores |
+
+## Citation
+
+If you find our work useful, please consider citing our paper:
+
+```bibtex
+@inproceedings{grab2026,
+    title     = {Latent Bridges for Multi-Table Question Answering},
+    author    = {Varriale, Simone and Cucumides, Tamara and
+                 Geerts, Floris and Papotti, Paolo},
+    booktitle = {Proceedings of the 2026 Conference on Empirical
+                 Methods in Natural Language Processing (EMNLP)},
+    month     = oct,
+    year      = {2026},
+    address   = {Budapest, Hungary},
+    publisher = {Association for Computational Linguistics}
+}
+```
