@@ -2,7 +2,7 @@
 
 GRAB is a framework for table question answering and table-grounded reasoning. It encodes structured tables as tripartite graphs and injects the resulting embeddings into a frozen large language model (LLM), enabling the model to reason over complex tabular data.
 
-Paper link: https://arxiv.org/abs/2606.28916
+Paper link: https://aclanthology.org/2026.emnlp-main.2073/
 
 ![GRAB architecture](GRAB.png)
 
@@ -325,15 +325,25 @@ bash script/test/baseline_llm_all_datasets.sh
 If you find our work useful, please consider citing our paper:
 
 ```bibtex
-@inproceedings{grab2026,
-    title     = {Latent Bridges for Multi-Table Question Answering},
-    author    = {Varriale, Simone and Cucumides, Tamara and
-                 Geerts, Floris and Papotti, Paolo},
-    booktitle = {Proceedings of the 2026 Conference on Empirical
-                 Methods in Natural Language Processing (EMNLP)},
-    month     = oct,
-    year      = {2026},
-    address   = {Budapest, Hungary},
-    publisher = {Association for Computational Linguistics}
+@inproceedings{varriale-etal-2026-latent,
+    title = "Latent Bridges for Multi-Table Question Answering",
+    author = "Varriale, Simone  and
+      Cucumides, Tamara  and
+      Geerts, Floris  and
+      Papotti, Paolo",
+    editor = "Lee, Hung-Yi  and
+      Dev, Sunipa  and
+      Li, Junyi Jessy  and
+      Elliott, Desmond",
+    booktitle = "Proceedings of the 2026 Conference on Empirical Methods in Natural Language Processing",
+    month = oct,
+    year = "2026",
+    address = "Budapest, Hungary",
+    publisher = "Association for Computational Linguistics",
+    url = "https://aclanthology.org/2026.emnlp-main.2073/",
+    doi = "10.18653/2026.emnlp-main.2073",
+    pages = "47201--47228",
+    ISBN = "979-8-89176-459-0",
+    abstract = "We introduce GRAB, a constructor{--}encoder{--}bridge pipeline for table question answering. Our method lifts relational data into a heterogeneous graph, encodes it via message passing, and transfers the signals to an LLM through a small set of query-conditioned latent tokens. The LLM receives these tokens alongside the serialized table, and the two play different roles: the graph shows where the relevant evidence is, while the text keeps the exact cell values that the graph does not encode. The graph supplements the text rather than replacing it, and our ablations confirm that both are required. Crucially, the LLM remains strictly frozen to preserve its general reasoning capabilities; we train only the lightweight graph encoder and latent bridge (91M parameters), allowing the entire pipeline to be trained efficiently. Our pipeline significantly improves performance on relational Question Answering, with the largest gains in demanding multi-table settings, offering an efficient, principled way to connect relational deep learning with LLMs."
 }
 ```
